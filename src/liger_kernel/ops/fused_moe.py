@@ -10,8 +10,11 @@ Runtime properties:
 - No host↔device sync anywhere on the hot path (the m-tile count is upper-bounded
   host-side and GEMM CTAs early-exit past the device-side actual count), so the op
   is CUDA-graph-capturable.
-- Tile sizes adapt to tokens-per-expert; kernels autotune per (H, I, BLOCK_M, TMA).
+- Tile sizes adapt to tokens-per-expert; grouped GEMMs autotune per
+  (H, I, BLOCK_M, TMA) and the dW kernels per (H, I, tokens-per-expert bucket).
 - Expert-weight loads use TMA descriptors on Hopper+ when shapes are 16B-aligned.
+- Blackwell datacenter parts (sm100/sm103) tune over an extended config space
+  (wide-N/deep-stage tiles enabled by TMEM accumulators); other archs are unchanged.
 - Inference (no input requires grad) skips saving/storing pre-activations.
 
 Env flags:
@@ -407,6 +410,14 @@ class LigerFusedMoEFunction(torch.autograd.Function):
 
         mem_eff = _MEMORY_EFFICIENT
 
+        # Tokens-per-expert bucket for the dW autotune keys: the best dW tile is
+        # regime-dependent (output-write-bound at small TK/E, K-loop-bound at
+        # large TK/E), but H_dim/I_dim alone can't see the difference — without
+        # this key the config tuned at the first-seen T is reused for every T.
+        # Clamped: below 16 / beyond 4096 tokens-per-expert the optimum stops
+        # moving, so extreme sizes share the edge buckets instead of retuning.
+        tpe_bucket = max(16, min(4096, triton.next_power_of_2(max(1, TK // max(1, E)))))
+
         # ---- dW2 = (s_k * y1)^T @ dO_gathered (memory-efficient order) ------
         # In memory-efficient mode s_k*y1 is recomputed from pre_act inside dW2, so
         # dW2 MUST run before the bwd-down-proj kernel overwrites pre_act in place.
@@ -442,6 +453,7 @@ class LigerFusedMoEFunction(torch.autograd.Function):
                 stride_dW2_H=ddown_proj.stride(1),
                 stride_dW2_I=ddown_proj.stride(2),
                 RECOMPUTE_WACT=True,
+                TPE_BUCKET=tpe_bucket,
             )
         else:
             weighted_act = torch.empty(TK, intermediate_dim, dtype=dO.dtype, device=dO.device)
@@ -515,6 +527,7 @@ class LigerFusedMoEFunction(torch.autograd.Function):
                 stride_dW2_H=ddown_proj.stride(1),
                 stride_dW2_I=ddown_proj.stride(2),
                 RECOMPUTE_WACT=False,
+                TPE_BUCKET=tpe_bucket,
             )
 
         # dx_expanded = d_pre_act @ W1^T
@@ -581,6 +594,7 @@ class LigerFusedMoEFunction(torch.autograd.Function):
             stride_dW1_E=dgate_up_proj.stride(0),
             stride_dW1_N=dgate_up_proj.stride(1),
             stride_dW1_H=dgate_up_proj.stride(2),
+            TPE_BUCKET=tpe_bucket,
         )
 
         return dx, dgate_up_proj, ddown_proj, None, dS.to(topk_weights_flat.dtype).view(T, K)

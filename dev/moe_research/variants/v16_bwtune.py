@@ -1,3 +1,20 @@
+"""
+Variant v16_bwtune — Blackwell-gated autotune config spaces.
+Based on: v15_fixdx (merged-K dX bugfix).
+
+Changes (all inside the config-list builders, gated on cap major == 10 so
+Hopper/Ampere spaces are untouched):
+1. GEMM space: add wide-N (BN=256) x deep-stage (ns=3-5) x nw=4 configs and two
+   GROUP_M=16 probes. Rationale: B300 (sm103) runs tcgen05 MMAs with accumulators
+   in TMEM, so wide tiles don't pay the register-pressure tax they do on Hopper;
+   measured 1103 TFLOPS on a gathered-GEMM probe at BN=256/BK=64/ns=3 vs 808 at
+   the Hopper-favored BN=128/BK=64/ns=4 (probe_ctas_bigm.py).
+2. dW space: add BK=128 deep-K, ns=4, and GROUP_M=8 configs (dW kernels sit at
+   526-632 TFLOPS on B300; L2 is 132 MB vs H100's 50 MB so bigger CTA groups fit).
+3. Token-gather space: add BLOCK_H=1024 rows (HBM3e likes longer contiguous
+   vectors; B300 copy BW is 6.4 TB/s vs H100's 3.3).
+"""
+
 # Triton kernels for fused MoE expert computation.
 #
 # Routing metadata kernels (Kernels 1-3) are adapted from:
@@ -13,8 +30,6 @@ import os
 
 import triton
 import triton.language as tl
-
-from liger_kernel.utils import infer_device_arch
 
 # LIGER_FUSED_MOE_AUTOTUNE=0 pins each kernel to one config, skipping Triton's
 # `do_bench` loop whose per-config working sets can OOM (see issue #1246). Must
@@ -32,28 +47,17 @@ _AUTOTUNE_DISABLED = os.environ.get("LIGER_FUSED_MOE_AUTOTUNE", "1").lower() in 
 _MEMORY_EFFICIENT = os.environ.get("LIGER_FUSED_MOE_MEMORY_EFFICIENT", "0").lower() in ("1", "true", "yes")
 
 
-def _is_blackwell_datacenter() -> bool:
+def _is_blackwell_datacenter():
     """True on sm100/sm103 (B200/B300 class) — the parts with tcgen05 MMA + TMEM.
 
-    Used to extend (never replace) the autotune config spaces: TMEM accumulators
-    make wide-N tiles cheap there, and tcgen05 MMAs are issued by a single warp
-    so num_warps=4 competes with 8. Deliberately excludes consumer Blackwell
-    (sm120, "blackwell_consumer"): it has neither TMEM nor 228 KB smem, so the
-    wide-tile configs would only waste tuning time as OutOfResources skips.
-
-    Only called from the autotuners' early_config_prune hooks (i.e. at first
-    kernel launch), NOT at import: infer_device_arch() initializes CUDA, and
-    importing liger_kernel must stay side-effect-free for fork-based workers.
+    Deliberately excludes consumer Blackwell (sm120): it has neither TMEM nor
+    228 KB smem, so the wide-tile configs below would only waste tuning time.
     """
-    return infer_device_arch() in ("blackwell", "blackwell_ultra")
+    import torch
 
-
-def _blackwell_config(kwargs, num_warps, num_stages):
-    """A triton.Config that the prune hooks drop on non-sm100/sm103 devices."""
-    cfg = triton.Config(kwargs, num_warps=num_warps, num_stages=num_stages)
-    cfg.liger_blackwell_only = True
-    return cfg
-
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability()[0] == 10
 
 # ---------------------------------------------------------------------------
 # Routing metadata overview
@@ -375,28 +379,28 @@ def _get_gemm_autotune_configs():
         (256, 128, 8, 2),
     ]:
         configs.append(triton.Config({"BLOCK_N": bn, "BLOCK_K": bk, "GROUP_M": 8}, num_warps=nw, num_stages=ns))
-    # sm100/sm103 extras (B300-measured), pruned away at launch on other archs:
-    # TMEM holds the fp32 accumulator, so BN=256 with deep pipelines wins where
-    # Hopper would spill registers — a gathered-GEMM probe hit 1103 TFLOPS at
-    # BN=256/BK=64/ns=3 vs 808 at the Hopper-favored BN=128/BK=64/ns=4.
-    # GROUP_M=16 probes exploit the 132 MB L2 (H100: 50 MB). Configs that exceed
-    # smem fail compile and are skipped by the autotuner (OutOfResources → inf).
-    for bn, bk, nw, ns in [
-        (256, 64, 4, 3),
-        (256, 64, 4, 4),
-        (256, 64, 8, 5),
-        (256, 128, 8, 3),
-        (256, 128, 4, 2),
-        (128, 128, 8, 4),
-        (128, 128, 4, 4),
-        (256, 32, 4, 4),
-    ]:
-        configs.append(_blackwell_config({"BLOCK_N": bn, "BLOCK_K": bk, "GROUP_M": 8}, num_warps=nw, num_stages=ns))
-    for bn, bk, nw, ns in [
-        (256, 64, 8, 3),
-        (128, 64, 8, 4),
-    ]:
-        configs.append(_blackwell_config({"BLOCK_N": bn, "BLOCK_K": bk, "GROUP_M": 16}, num_warps=nw, num_stages=ns))
+    if _is_blackwell_datacenter():
+        # sm100/sm103: accumulators live in TMEM (not registers), so wide-N tiles
+        # with deep pipelines are cheap; nw=4 often matches nw=8 because tcgen05
+        # MMAs are issued by a single warp. Measured on B300: BN=256/BK=64/ns=3
+        # gathered-GEMM probe hits 1103 TFLOPS vs 808 for BN=128/BK=64/ns=4.
+        # GROUP_M=16 probes exploit the 132 MB L2 (vs 50 MB on H100).
+        for bn, bk, nw, ns in [
+            (256, 64, 4, 3),
+            (256, 64, 4, 4),
+            (256, 64, 8, 5),
+            (256, 128, 8, 3),
+            (256, 128, 4, 2),
+            (128, 128, 8, 4),
+            (128, 128, 4, 4),
+            (256, 32, 4, 4),
+        ]:
+            configs.append(triton.Config({"BLOCK_N": bn, "BLOCK_K": bk, "GROUP_M": 8}, num_warps=nw, num_stages=ns))
+        for bn, bk, nw, ns in [
+            (256, 64, 8, 3),
+            (128, 64, 8, 4),
+        ]:
+            configs.append(triton.Config({"BLOCK_N": bn, "BLOCK_K": bk, "GROUP_M": 16}, num_warps=nw, num_stages=ns))
     return configs
 
 
@@ -412,41 +416,37 @@ def _get_dW_autotune_configs():
         for nw in [4, 8]
         for ns in [2, 3]
     ]
-    # sm100/sm103 extras (B300-measured, +22-26% backward at TK/E >= 512 together
-    # with the TPE_BUCKET key), pruned away at launch on other archs: deep-K
-    # (BK=128) reads token rows in fewer longer bursts (neutral on H100 per E13),
-    # ns=4 pipelines are free with TMEM accumulators, GROUP_M=8 halves re-reads
-    # of the per-expert row window in the larger L2.
-    for bm, bn, bk, gm, nw, ns in [
-        (128, 256, 128, 4, 8, 2),
-        (128, 256, 128, 4, 8, 3),
-        (128, 256, 64, 4, 8, 4),
-        (128, 256, 64, 4, 4, 3),
-        (128, 128, 128, 4, 8, 3),
-        (128, 256, 64, 8, 8, 3),
-        (128, 128, 64, 8, 8, 3),
-        (64, 256, 128, 4, 8, 3),
-    ]:
-        configs.append(
-            _blackwell_config({"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "GROUP_M": gm}, num_warps=nw, num_stages=ns)
-        )
+    if _is_blackwell_datacenter():
+        # Deep-K (BK=128) reads the token rows in fewer, longer bursts — neutral
+        # on H100 (E13) but B300's HBM3e prefers it; ns=4 pipelines are free with
+        # TMEM accumulators; GROUP_M=8 halves re-reads of the per-expert row
+        # window given the 132 MB L2.
+        for bm, bn, bk, gm, nw, ns in [
+            (128, 256, 128, 4, 8, 2),
+            (128, 256, 128, 4, 8, 3),
+            (128, 256, 64, 4, 8, 4),
+            (128, 256, 64, 4, 4, 3),
+            (128, 128, 128, 4, 8, 3),
+            (128, 256, 64, 8, 8, 3),
+            (128, 128, 64, 8, 8, 3),
+            (64, 256, 128, 4, 8, 3),
+        ]:
+            configs.append(
+                triton.Config({"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "GROUP_M": gm}, num_warps=nw, num_stages=ns)
+            )
     return configs
 
 
 def _make_tile_prune(n_extent_of, m_extent_of=None):
-    """Shape/arch-aware early config pruning.
+    """Shape-aware early config pruning: drop tiles wider than the (padded) problem.
 
-    Drops (a) tiles wider than the (padded) problem — cuts first-run
-    compile+tune cost dramatically for small shapes (e.g. unit tests) — and
-    (b) the Blackwell-datacenter-only configs when not on sm100/sm103, keeping
-    other architectures' search spaces exactly as tuned on H100. Falls back to
-    the full list if pruning would empty it.
+    Cuts first-run compile+tune cost dramatically for small shapes (e.g. unit
+    tests) without touching the search space for large shapes. Falls back to the
+    full list if pruning would empty it.
     """
 
     def prune(configs, nargs, **kwargs):
         args = {**nargs, **kwargs}
-        if not _is_blackwell_datacenter():
-            configs = [c for c in configs if not getattr(c, "liger_blackwell_only", False)]
         n_extent = triton.next_power_of_2(max(64, n_extent_of(args)))
         m_extent = triton.next_power_of_2(max(64, m_extent_of(args))) if m_extent_of is not None else None
         pruned = [
@@ -731,7 +731,7 @@ def _get_token_gather_autotune_configs():
         return [triton.Config({"BLOCK_H": 128, "BLOCK_K": 4}, num_warps=4, num_stages=4)]
     configs = []
     # BLOCK_H=1024 rows help on Blackwell (HBM3e rewards longer contiguous
-    # vectors; B300 sustains 6.4 TB/s vs H100's 3.3) and are harmless elsewhere.
+    # vectors; B300 hits 6.4 TB/s vs H100's 3.3) and are harmless elsewhere.
     for bh in [64, 128, 256, 512, 1024]:
         for bk in [1, 2, 4, 8, 16]:
             for nw in [4, 8]:
@@ -947,7 +947,7 @@ def _moe_bwd_down_proj_kernel(
 
 @triton.autotune(
     configs=_get_dW_autotune_configs(),
-    key=["H_dim", "I_dim", "RECOMPUTE_WACT", "TPE_BUCKET"],
+    key=["H_dim", "I_dim", "RECOMPUTE_WACT"],
     prune_configs_by={"early_config_prune": _prune_dW2},
 )
 @triton.jit
@@ -976,7 +976,6 @@ def _moe_bwd_dW2_kernel(
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
     RECOMPUTE_WACT: tl.constexpr,  # True → recompute s_k*y1 from pre_act (no wact buffer)
-    TPE_BUCKET: tl.constexpr = 0,  # tokens-per-expert bucket; autotune key only (unused in body)
 ):
     """dW2[e, h, i] = sum_t (s_k*y1)[t, i] * dout[token(t), h] for tokens in e.
     s_k*y1 either read from the materialized weighted_act buffer, or (memory-
@@ -1083,7 +1082,7 @@ def _moe_bwd_dX_expanded_kernel(
 ):
     """Grid: 1D (num_m_tiles_max * ceil(H/BLOCK_N),), L2-swizzled into (pid_m, pid_n).
     dx_expanded[sorted_pos] = d_pre_act @ W1[e] — a single GEMM over K = 2I
-    (d_pre_act columns and W1[e] rows share the same [gate; up] ordering).
+    (d_pre_act columns and W1 rows share the same [gate; up] ordering).
     No atomics — rows are unique per CTA in sorted space."""
     pid = tl.program_id(0)
     NUM_PID_N: tl.constexpr = (H_dim + BLOCK_N - 1) // BLOCK_N
@@ -1155,7 +1154,7 @@ def _moe_bwd_dX_expanded_kernel(
 
 @triton.autotune(
     configs=_get_dW_autotune_configs(),
-    key=["H_dim", "I_dim", "TPE_BUCKET"],
+    key=["H_dim", "I_dim"],
     prune_configs_by={"early_config_prune": _prune_dW1},
 )
 @triton.jit
@@ -1178,7 +1177,6 @@ def _moe_bwd_dW1_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
-    TPE_BUCKET: tl.constexpr = 0,  # tokens-per-expert bucket; autotune key only (unused in body)
 ):
     """dW1[e, n, h] = sum_t X[token(t), h] * d_pre_act[t, n], where n in [0, 2I).
     Grid: 1D (E * ceil(H/BLOCK_M) * ceil(2I/BLOCK_N),), expert-major so all tiles of
@@ -1229,3 +1227,576 @@ def _moe_bwd_dW1_kernel(
 
     dW1_ptrs = dW1_ptr + expert_idx * stride_dW1_E + n_idx[:, None] * stride_dW1_N + h_idx[None, :] * stride_dW1_H
     tl.store(dW1_ptrs, acc.to(dW1_ptr.dtype.element_ty), mask=n_mask[:, None] & h_mask[None, :])
+
+
+# ============================================================================
+# autograd wrapper (from src/liger_kernel/ops/fused_moe.py)
+# ============================================================================
+
+"""
+Fused MoE expert computation via Triton grouped GEMM.
+
+Forward: routing metadata (3 kernels, sync-free) → fused gather+GEMM+SwiGLU →
+down-proj → token aggregation.
+Backward: memory-efficient — recomputes dA' = dO@W2^T instead of caching Y (TK×H)
+and accumulates router-score gradients in fp32.
+
+Runtime properties:
+- No host↔device sync anywhere on the hot path (the m-tile count is upper-bounded
+  host-side and GEMM CTAs early-exit past the device-side actual count), so the op
+  is CUDA-graph-capturable.
+- Tile sizes adapt to tokens-per-expert; kernels autotune per (H, I, BLOCK_M, TMA).
+- Expert-weight loads use TMA descriptors on Hopper+ when shapes are 16B-aligned.
+- Inference (no input requires grad) skips saving/storing pre-activations.
+
+Env flags:
+- LIGER_FUSED_MOE_AUTOTUNE=0: pin one config per kernel (skip tuning; see #1246).
+- LIGER_FUSED_MOE_MEMORY_EFFICIENT=1: backward writes SwiGLU gradients in place
+  over the saved pre-activations (saves TK*2I*itemsize bytes) and drops the
+  (TK, I) weighted_act buffer (dW2 recomputes s_k*silu(gate)*up on the fly;
+  saves TK*I*itemsize bytes). Combined ≈ −1.2 GB peak at T=32768/I=768/bf16 for a
+  ~10-15% slower backward. In this mode a second backward over the same graph
+  (retain_graph) raises a version-counter error — by design.
+"""
+
+import torch
+
+from liger_kernel.ops.utils import ensure_contiguous
+
+
+# Device-side TMA descriptors (tl.make_tensor_descriptor) need a global-memory
+# scratch allocator. Triton stores it in a ContextVar, which does NOT propagate to
+# the autograd engine's backward thread — so it is (re)registered at the top of
+# both forward() and backward() instead of only at import time.
+def _tma_alloc_fn(size: int, alignment: int, stream):
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+
+
+def _ensure_tma_allocator():
+    triton.set_allocator(_tma_alloc_fn)
+
+
+# Fallback M-tile size (used when callers pass no explicit block_m_token).
+# The autograd function picks it adaptively per call via _pick_block_m_token.
+BLOCK_M_TOKEN = 64
+
+
+def _tma_eligibility(t, H: int, intermediate_dim: int, E: int):
+    """TMA needs sm90+, 16-byte-aligned rows, and int32-addressable row counts.
+    W1 view is (E*2I, H) (row stride H), W2 view is (E*H, I) (row stride I)."""
+    if t.device.type != "cuda" or torch.cuda.get_device_capability(t.device)[0] < 9:
+        return False, False
+    itemsize = t.element_size()
+    w1_ok = (H * itemsize) % 16 == 0 and E * 2 * intermediate_dim < 2**31
+    w2_ok = (intermediate_dim * itemsize) % 16 == 0 and E * H < 2**31
+    return w1_ok, w2_ok
+
+
+def _pick_block_m_token(TK: int, E: int) -> int:
+    """Match the M-tile to the expected expert segment length: large tiles at high
+    occupancy amortize weight re-reads; small tiles at low occupancy avoid running
+    mostly-padded MMAs (e.g. T=128,K=8,E=128 → 8 tokens/expert → 87% padding at 64)."""
+    avg = max(1, TK // max(1, E))
+    b = triton.next_power_of_2(avg)
+    return max(16, min(128, b))
+
+
+# ---------------------------------------------------------------------------
+# Routing metadata
+# ---------------------------------------------------------------------------
+
+
+def compute_routing_metadata(topk_indices: torch.Tensor, E: int, block_m_token: int = BLOCK_M_TOKEN):
+    """Compute token→expert routing permutation metadata via 3 Triton kernels.
+
+    Fully sync-free: tile metadata is allocated at a host-computable upper bound
+    (TK//block_m_token + min(E, TK)); the actual m-tile count stays on device in
+    expert_tile_offset[E] and the GEMM kernels early-exit CTAs past it. No CPU
+    loop, no .item(), so the whole path is CUDA-graph-capturable.
+
+    Args:
+        topk_indices:  (T, K) int32 — pre-computed top-k expert indices per token
+        E:             number of experts
+        block_m_token: BLOCK_M for token-dimension tiling (default BLOCK_M_TOKEN)
+
+    Returns:
+        expert_token_count:     (E,)              int32
+        expert_start_idx:       (E+1,)            int32
+        x_gather_idx:           (TK,)             int32
+        s_scatter_idx:          (TK,)             int32
+        s_reverse_scatter_idx:  (TK,)             int32
+        tile_row_start:         (num_m_tiles_max,) int32 — absolute row_start per M-tile
+        tile_expert:            (num_m_tiles_max,) int32 — expert index per M-tile
+        expert_tile_offset:     (E+1,)            int32 — cumsum of per-expert tile
+                                counts; [E] holds the actual total m-tile count
+    """
+    T, K = topk_indices.shape
+    TK = T * K
+    device = topk_indices.device
+    E_POW2 = triton.next_power_of_2(E)
+    K_POW2 = triton.next_power_of_2(K)
+    TOKENS_PER_BLOCK = max(1, 1024 // K_POW2)
+    n_tiles = triton.cdiv(T, TOKENS_PER_BLOCK)
+
+    # Kernel 1: tiled histogram → tile_expert_counts (E, n_tiles)
+    tile_expert_counts = torch.empty(E, n_tiles, dtype=torch.int32, device=device)
+    _moe_router_histogram_kernel[(n_tiles,)](
+        topk_indices,
+        tile_expert_counts,
+        T,
+        E=E,
+        n_tiles=n_tiles,
+        TOKENS_PER_TILE=TOKENS_PER_BLOCK,
+        K_POW2=K_POW2,
+        K=K,
+        E_POW2=E_POW2,
+    )
+
+    expert_token_count = tile_expert_counts.sum(dim=1, dtype=torch.int32)  # (E,)
+
+    # Kernel 2: prefix sums + expert offsets + tile offsets (all in one pass)
+    expert_start_idx = torch.empty(E + 1, dtype=torch.int32, device=device)
+    expert_tile_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
+    _moe_router_prefix_sum_kernel[(E + 2,)](
+        expert_token_count,
+        expert_start_idx,
+        expert_tile_offset,
+        E=E,
+        partial_sum_ptr=tile_expert_counts,
+        n_tiles=n_tiles,
+        TK=TK,
+        BLOCK_M=128,
+        BLOCK_N=E_POW2,
+        BLOCK_M_TOKEN=block_m_token,
+    )
+
+    # No host sync: allocate tile metadata at the worst-case bound and let GEMM
+    # CTAs past the actual count (expert_tile_offset[E], read on device) exit early.
+    # Bound: sum_e ceil(f_e / B) <= floor(TK / B) + #nonempty_experts <= TK//B + min(E, TK).
+    num_m_tiles_max = TK // block_m_token + min(E, TK)
+
+    tile_row_start = torch.empty(num_m_tiles_max, dtype=torch.int32, device=device)
+    tile_expert = torch.empty(num_m_tiles_max, dtype=torch.int32, device=device)
+
+    # Kernel 3: sort by expert + scatter permutation arrays + tile metadata
+    s_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
+
+    if TK > 0:
+        _moe_router_scatter_kernel[(n_tiles,)](
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            x_gather_idx,
+            tile_row_start,
+            tile_expert,
+            topk_indices,
+            T,
+            tile_expert_counts,  # non-contiguous (E, n_tiles) view
+            n_tiles,
+            expert_start_idx[:E],  # E entries (without TK sentinel)
+            expert_tile_offset[:E],  # E entries of cumulative tile counts
+            K_POW2=K_POW2,
+            K=K,
+            TOKENS_PER_BLOCK=TOKENS_PER_BLOCK,
+            BLOCK_M_TOKEN=block_m_token,
+        )
+
+    return (
+        expert_token_count,
+        expert_start_idx,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        tile_row_start,
+        tile_expert,
+        expert_tile_offset,
+    )
+
+
+def _token_aggregation(Y, topk_weights_flat, s_reverse_scatter_idx, T, K, H):
+    """Weighted gather-sum: out[t] = sum_k w[t,k] * Y[s_rev[t*K+k]]."""
+    out = torch.empty(T, H, dtype=Y.dtype, device=Y.device)
+    _token_gather_weighted_sum_kernel[lambda meta: (T, triton.cdiv(H, meta["BLOCK_H"]))](
+        Y,
+        topk_weights_flat,
+        s_reverse_scatter_idx,
+        out,
+        H_dim=H,
+        K_dim=K,
+        stride_Y_TK=Y.stride(0),
+        stride_Y_H=Y.stride(1),
+        stride_out_T=out.stride(0),
+        stride_out_H=out.stride(1),
+        w_is_None=False,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Autograd Function
+# ---------------------------------------------------------------------------
+
+
+class LigerFusedMoEFunction(torch.autograd.Function):
+    """Fused grouped GEMM MoE forward + memory-efficient backward.
+
+    Forward: routing metadata → fused gather+GEMM+SwiGLU → down-proj → token aggregation.
+    Backward: avoids caching Y (TK×H) by recomputing dA' = dO@W2^T.
+
+    Troubleshooting:
+        If Triton's autotune ``do_bench`` loop OOMs (each config holds its own
+        working set — see issue #1246), set ``LIGER_FUSED_MOE_AUTOTUNE=0`` before
+        importing liger_kernel to pin each kernel to a single config and skip the
+        benchmark loop. Temporary escape hatch until triton's autotuner handles
+        such errors itself.
+
+        Set ``LIGER_FUSED_MOE_MEMORY_EFFICIENT=1`` to shave another ~TK*3I*itemsize
+        bytes off backward peak memory (in-place SwiGLU backward + weighted_act
+        recompute) at ~10-15% slower backward; retain_graph re-backward then raises.
+    """
+
+    @staticmethod
+    @ensure_contiguous
+    def forward(ctx, x, gate_up_proj, down_proj, top_k_index, top_k_weights):
+        """
+        Args:
+            x:             (T, H)      input tokens
+            gate_up_proj:  (E, 2*intermediate_dim, H) gate+up projection weights
+            down_proj:     (E, H, intermediate_dim)   down projection weights
+            top_k_index:   (T, K) int32 — pre-computed routing indices
+            top_k_weights: (T, K) float — pre-computed routing scores
+        Returns:
+            output: (T, H)
+        """
+        T, K = top_k_index.shape
+        E = gate_up_proj.shape[0]
+        H = x.shape[1]
+        intermediate_dim = gate_up_proj.shape[1] // 2
+        TK = T * K
+
+        block_m_token = _pick_block_m_token(TK, E)
+        use_tma_w1, use_tma_w2 = _tma_eligibility(x, H, intermediate_dim, E)
+        if use_tma_w1 or use_tma_w2:
+            _ensure_tma_allocator()
+        # Inference: no input needs grad → skip saving/storing pre_act (TK×2I bytes).
+        needs_grad = (
+            x.requires_grad or gate_up_proj.requires_grad or down_proj.requires_grad or (top_k_weights.requires_grad)
+        )
+
+        with torch.no_grad():
+            (
+                _,
+                expert_start_idx,
+                x_gather_idx,
+                s_scatter_idx,
+                s_reverse_scatter_idx,
+                tile_row_start,
+                tile_expert,
+                expert_tile_offset,
+            ) = compute_routing_metadata(top_k_index, E, block_m_token)
+
+        num_m_tiles = tile_row_start.shape[0]  # upper bound; actual count lives on device
+        total_tiles_dev = expert_tile_offset[E:]
+
+        post_act = torch.empty(TK, intermediate_dim, dtype=x.dtype, device=x.device)
+        # pre_act only exists in training; in inference the kernel skips the store
+        # entirely (post_act doubles as a dummy pointer that is never written).
+        pre_act = torch.empty(TK, 2 * intermediate_dim, dtype=x.dtype, device=x.device) if needs_grad else post_act
+
+        if num_m_tiles > 0:
+            _fused_up_proj_swiglu_kernel[lambda meta: (num_m_tiles * triton.cdiv(intermediate_dim, meta["BLOCK_N"]),)](
+                x,
+                gate_up_proj,
+                x_gather_idx,
+                expert_start_idx,
+                tile_row_start,
+                tile_expert,
+                total_tiles_dev,
+                pre_act,
+                post_act,
+                w_rows=E * 2 * intermediate_dim,
+                H_dim=H,
+                I_dim=intermediate_dim,
+                stride_x_T=x.stride(0),
+                stride_x_H=x.stride(1),
+                stride_w_E=gate_up_proj.stride(0),
+                stride_w_N=gate_up_proj.stride(1),
+                stride_w_K=gate_up_proj.stride(2),
+                stride_pre_TK=pre_act.stride(0),
+                stride_pre_N=pre_act.stride(1),
+                stride_post_TK=post_act.stride(0),
+                stride_post_N=post_act.stride(1),
+                BLOCK_M=block_m_token,
+                USE_TMA=use_tma_w1,
+                STORE_PREACT=needs_grad,
+            )
+
+        Y = torch.empty(TK, H, dtype=x.dtype, device=x.device)
+
+        if num_m_tiles > 0:
+            _fused_down_proj_kernel[lambda meta: (num_m_tiles * triton.cdiv(H, meta["BLOCK_N"]),)](
+                post_act,
+                down_proj,
+                expert_start_idx,
+                tile_row_start,
+                tile_expert,
+                total_tiles_dev,
+                Y,
+                w_rows=E * H,
+                H_dim=H,
+                I_dim=intermediate_dim,
+                stride_post_TK=post_act.stride(0),
+                stride_post_I=post_act.stride(1),
+                stride_w_E=down_proj.stride(0),
+                stride_w_H=down_proj.stride(1),
+                stride_w_I=down_proj.stride(2),
+                stride_Y_TK=Y.stride(0),
+                stride_Y_H=Y.stride(1),
+                BLOCK_M=block_m_token,
+                USE_TMA=use_tma_w2,
+            )
+
+        topk_weights_flat = top_k_weights.flatten().contiguous()
+        out = _token_aggregation(Y, topk_weights_flat, s_reverse_scatter_idx, T, K, H)
+
+        if needs_grad:
+            ctx.save_for_backward(
+                x,
+                gate_up_proj,
+                down_proj,
+                pre_act,
+                topk_weights_flat,
+                expert_start_idx,
+                x_gather_idx,
+                s_scatter_idx,
+                s_reverse_scatter_idx,
+                tile_row_start,
+                tile_expert,
+                total_tiles_dev,
+            )
+        ctx.T = T
+        ctx.K = K
+        ctx.E = E
+        ctx.H = H
+        ctx.intermediate_dim = intermediate_dim
+        ctx.TK = TK
+        ctx.num_m_tiles = num_m_tiles
+        ctx.block_m_token = block_m_token
+        ctx.mark_non_differentiable(top_k_index)
+        ctx.set_materialize_grads(False)
+
+        return out
+
+    @staticmethod
+    @ensure_contiguous
+    def backward(ctx, dO):
+        if dO is None:
+            return None, None, None, None, None
+
+        (
+            x,
+            gate_up_proj,
+            down_proj,
+            pre_act,
+            topk_weights_flat,
+            expert_start_idx,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            tile_row_start,
+            tile_expert,
+            total_tiles_dev,
+        ) = ctx.saved_tensors
+
+        T = ctx.T
+        K = ctx.K
+        E = ctx.E
+        H = ctx.H
+        intermediate_dim = ctx.intermediate_dim
+        TK = ctx.TK
+        num_m_tiles = ctx.num_m_tiles
+        block_m_token = ctx.block_m_token
+        use_tma_w1, use_tma_w2 = _tma_eligibility(dO, H, intermediate_dim, E)
+        if use_tma_w1 or use_tma_w2:
+            _ensure_tma_allocator()
+
+        mem_eff = _MEMORY_EFFICIENT
+
+        # ---- dW2 = (s_k * y1)^T @ dO_gathered (memory-efficient order) ------
+        # In memory-efficient mode s_k*y1 is recomputed from pre_act inside dW2, so
+        # dW2 MUST run before the bwd-down-proj kernel overwrites pre_act in place.
+        # empty (not zeros): the kernel writes every element, storing 0 for empty experts.
+        ddown_proj = torch.empty_like(down_proj)
+        if mem_eff:
+            # No weighted_act buffer, and d_pre_act aliases pre_act (in-place):
+            # each (row, n) element is consumed and produced by the same CTA, so
+            # the alias is race-free and saves a (TK, 2I) buffer. Costs support
+            # for a second backward over the same graph (version check raises).
+            weighted_act = pre_act[:0]  # dummy, never read
+            d_pre_act = pre_act
+            _moe_bwd_dW2_kernel[
+                lambda meta: (E * triton.cdiv(intermediate_dim, meta["BLOCK_M"]) * triton.cdiv(H, meta["BLOCK_N"]),)
+            ](
+                weighted_act,
+                pre_act,
+                s_scatter_idx,
+                topk_weights_flat,
+                dO,
+                x_gather_idx,
+                expert_start_idx,
+                ddown_proj,
+                H_dim=H,
+                I_dim=intermediate_dim,
+                stride_wact_TK=0,
+                stride_wact_I=1,
+                stride_pre_TK=pre_act.stride(0),
+                stride_pre_N=pre_act.stride(1),
+                stride_dout_T=dO.stride(0),
+                stride_dout_H=dO.stride(1),
+                stride_dW2_E=ddown_proj.stride(0),
+                stride_dW2_H=ddown_proj.stride(1),
+                stride_dW2_I=ddown_proj.stride(2),
+                RECOMPUTE_WACT=True,
+            )
+        else:
+            weighted_act = torch.empty(TK, intermediate_dim, dtype=dO.dtype, device=dO.device)
+            d_pre_act = torch.empty(TK, 2 * intermediate_dim, dtype=dO.dtype, device=dO.device)
+
+        # ---- dA' = dO @ W2^T, SwiGLU backward → d_pre_act, dS ---------------
+        # fp32 dS: atomic_add accumulates ceil(I/BLOCK_N) partials per element;
+        # low-precision atomics would round every partial.
+        dS = torch.zeros(TK, dtype=torch.float32, device=dO.device)
+
+        if num_m_tiles > 0:
+            _moe_bwd_down_proj_kernel[lambda meta: (num_m_tiles * triton.cdiv(intermediate_dim, meta["BLOCK_N"]),)](
+                dO,
+                x_gather_idx,
+                s_scatter_idx,
+                topk_weights_flat,
+                down_proj,
+                pre_act,
+                expert_start_idx,
+                tile_row_start,
+                tile_expert,
+                total_tiles_dev,
+                d_pre_act,
+                weighted_act,
+                dS,
+                w_rows=E * H,
+                H_dim=H,
+                I_dim=intermediate_dim,
+                stride_dO_T=dO.stride(0),
+                stride_dO_H=dO.stride(1),
+                stride_w_E=down_proj.stride(0),
+                stride_w_H=down_proj.stride(1),
+                stride_w_I=down_proj.stride(2),
+                stride_pre_TK=pre_act.stride(0),
+                stride_pre_N=pre_act.stride(1),
+                stride_d_pre_TK=d_pre_act.stride(0),
+                stride_d_pre_N=d_pre_act.stride(1),
+                stride_wact_TK=weighted_act.stride(0) if not mem_eff else 0,
+                stride_wact_I=weighted_act.stride(1) if not mem_eff else 1,
+                BLOCK_M=block_m_token,
+                USE_TMA=use_tma_w2,
+                WRITE_WACT=not mem_eff,
+            )
+
+        if mem_eff:
+            # pre_act now holds d_pre_act; bump its autograd version so a second
+            # backward through the same graph errors out instead of silently
+            # producing garbage.
+            torch.autograd.graph.increment_version(pre_act)
+        else:
+            _moe_bwd_dW2_kernel[
+                lambda meta: (E * triton.cdiv(intermediate_dim, meta["BLOCK_M"]) * triton.cdiv(H, meta["BLOCK_N"]),)
+            ](
+                weighted_act,
+                pre_act,
+                s_scatter_idx,
+                topk_weights_flat,
+                dO,
+                x_gather_idx,
+                expert_start_idx,
+                ddown_proj,
+                H_dim=H,
+                I_dim=intermediate_dim,
+                stride_wact_TK=weighted_act.stride(0),
+                stride_wact_I=weighted_act.stride(1),
+                stride_pre_TK=pre_act.stride(0),
+                stride_pre_N=pre_act.stride(1),
+                stride_dout_T=dO.stride(0),
+                stride_dout_H=dO.stride(1),
+                stride_dW2_E=ddown_proj.stride(0),
+                stride_dW2_H=ddown_proj.stride(1),
+                stride_dW2_I=ddown_proj.stride(2),
+                RECOMPUTE_WACT=False,
+            )
+
+        # dx_expanded = d_pre_act @ W1^T
+        dx_expanded = torch.empty(TK, H, dtype=dO.dtype, device=dO.device)
+
+        if num_m_tiles > 0:
+            _moe_bwd_dX_expanded_kernel[lambda meta: (num_m_tiles * triton.cdiv(H, meta["BLOCK_N"]),)](
+                d_pre_act,
+                gate_up_proj,
+                expert_start_idx,
+                tile_row_start,
+                tile_expert,
+                total_tiles_dev,
+                dx_expanded,
+                w_rows=E * 2 * intermediate_dim,
+                H_dim=H,
+                I_dim=intermediate_dim,
+                stride_d_pre_TK=d_pre_act.stride(0),
+                stride_d_pre_N=d_pre_act.stride(1),
+                stride_w_E=gate_up_proj.stride(0),
+                stride_w_N=gate_up_proj.stride(1),
+                stride_w_K=gate_up_proj.stride(2),
+                stride_dxe_TK=dx_expanded.stride(0),
+                stride_dxe_H=dx_expanded.stride(1),
+                BLOCK_M=block_m_token,
+                USE_TMA=use_tma_w1,
+            )
+
+        # dx = unweighted gather-sum of dx_expanded
+        # empty (not zeros): the gather-sum kernel stores every (t, h) element.
+        dx = torch.empty(T, H, dtype=dO.dtype, device=dO.device)
+        if TK > 0:
+            _token_gather_weighted_sum_kernel[lambda meta: (T, triton.cdiv(H, meta["BLOCK_H"]))](
+                dx_expanded,
+                dS,  # dummy w_ptr — never loaded when w_is_None=True
+                s_reverse_scatter_idx,
+                dx,
+                H_dim=H,
+                K_dim=K,
+                stride_Y_TK=dx_expanded.stride(0),
+                stride_Y_H=dx_expanded.stride(1),
+                stride_out_T=dx.stride(0),
+                stride_out_H=dx.stride(1),
+                w_is_None=True,
+            )
+
+        # dW1 = X_gathered^T @ d_pre_act
+        # empty (not zeros): the kernel writes every element, storing 0 for empty experts.
+        dgate_up_proj = torch.empty_like(gate_up_proj)
+        _moe_bwd_dW1_kernel[
+            lambda meta: (E * triton.cdiv(H, meta["BLOCK_M"]) * triton.cdiv(2 * intermediate_dim, meta["BLOCK_N"]),)
+        ](
+            x,
+            d_pre_act,
+            x_gather_idx,
+            expert_start_idx,
+            dgate_up_proj,
+            H_dim=H,
+            I_dim=intermediate_dim,
+            stride_x_T=x.stride(0),
+            stride_x_H=x.stride(1),
+            stride_d_pre_TK=d_pre_act.stride(0),
+            stride_d_pre_N=d_pre_act.stride(1),
+            stride_dW1_E=dgate_up_proj.stride(0),
+            stride_dW1_N=dgate_up_proj.stride(1),
+            stride_dW1_H=dgate_up_proj.stride(2),
+        )
+
+        return dx, dgate_up_proj, ddown_proj, None, dS.to(topk_weights_flat.dtype).view(T, K)

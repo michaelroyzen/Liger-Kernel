@@ -1,5 +1,12 @@
 # MoE Triton Kernel Autoresearch Log
 
+> **Phase B (B300/Blackwell) lives at the bottom of this file** — it found and fixed an
+> sm103 miscompile that made the shipped dx gradients silently wrong on Blackwell (E19),
+> re-ran the E18 backlog with probes (three of its top ideas died cheaply), and shipped
+> Blackwell-gated config spaces + per-regime dW autotune keys: v0→final on B300 is
+> **2.07×/2.35× full step @ T=8192/32768** with correct gradients. H100 results below
+> are unchanged.
+
 ## FINAL RESULT (shipped in `src/liger_kernel/ops/fused_moe*.py`)
 
 Qwen3-MoE-30B shard (E=128, H=2048, I=768, K=8, bf16, H100 80GB, torch 2.12.1/triton 3.7.1),
@@ -368,3 +375,228 @@ runs unchanged on a new GPU.
 
 Caution from this project's own base rate: 5 of 12 paper-plausible hypotheses lost on silicon
 (E9/E10/E13/E14 + part of E7). Treat this list as an experiment queue, not a promise.
+
+---
+
+# Phase B: Blackwell (B300, sm103) — continuation of the E18 backlog
+
+## Environment (Phase B)
+
+- GPU: NVIDIA B300 SXM6 AC (sm103, cap (10,3)), 148 SMs, 275 GB HBM3e, 132.6 MB L2,
+  driver 595.71.05, CUDA 13.2
+- torch 2.12.1+cu130, triton 3.7.1, python 3.12 (fresh `uv venv` at `.venv`,
+  `uv pip install torch --index-url .../cu130` + `uv pip install -e ".[dev]"`)
+- Measured peaks (this box): bf16 matmul 1480-1580 TFLOPS (torch/cuBLAS n=4096-16384),
+  device-to-device copy 6.41 TB/s
+- Roofline (Qwen3 config): ridge ≈ 230 flops/B. Fwd 618 GFLOP @T=8192 → ideal ≈ 0.42 ms;
+  weight read floor 1.21 GB → 0.19 ms. Same "compute AND memory both matter" regime as H100,
+  but both ceilings ≈ 1.5-1.9× higher.
+
+### E19 — B300 environment + correctness gate → found sm103 MISCOMPILE; fixed in V15 (`v15_fixdx`)
+
+`check_correctness` on the shipped src kernel **FAILED on B300**: dx wrong by ~44% of elements
+(fp32, T=512/E=8/H=256/I=128/K=2; H100 numbers with the identical wheel stack were clean).
+Isolated with `probe_sm103_dot.py` to a **Triton 3.7.1 sm103 miscompile**: two `tl.dot` calls
+chained through ONE accumulator inside a K-loop produce garbage under the tcgen05 MMA path
+(max err ~60 on values O(50)); one dot per loop is fine; two dots into two accumulators is
+fine; BM=16 (non-tcgen05 lowering) is fine. Exactly one MoE kernel used the bad pattern:
+`_moe_bwd_dX_expanded_kernel` (gate half-GEMM + up half-GEMM into one acc). Per-config probe
+(`probe_b300_configs.py`): 21 of 40 autotune configs compute wrong dx, 15 OOM-skip, only the
+4 BK=128 configs happened to be correct — so autotune usually lands on a broken config.
+
+**V15 fix**: compute dx = d_pre_act @ W1[e] as a SINGLE GEMM over K=2I (d_pre_act columns and
+W1[e] rows share the same [gate; up] ordering — the two-half split was never mathematically
+necessary, it just mirrored the forward kernel's structure). Architecture-neutral, TMA path
+unchanged (same flattened descriptor, k now spans [0,2I)), and the K-loop gets twice as many
+single-dot iterations → also pipelines better. v0_baseline has the same latent bug on B300
+(its timings below are still valid; its dx is silently wrong on sm100/sm103).
+`check_correctness(v15)`: PASS.
+
+Baseline A/B on B300 (`results/b300_e19_baseline.txt`), Qwen3-MoE-30B shard, bf16:
+
+| T | mode | v0 ms | v15 ms | speedup |
+|---|------|-------|--------|---------|
+| 128 | fwd / bwd / full / infer | 0.365 / 0.938 / 1.317 / 0.352 | 0.318 / 0.553 / 0.775 / 0.283 | 1.15 / 1.70 / 1.70 / 1.24 |
+| 1024 | fwd / bwd / full / infer | 0.398 / 1.310 / 1.729 / 0.401 | 0.309 / 0.780 / 1.067 / 0.288 | 1.29 / 1.68 / 1.62 / 1.39 |
+| 8192 | fwd / bwd / full / infer | 1.320 / 5.059 / 6.360 / 1.338 | 0.949 / 2.661 / 3.573 / 0.905 | 1.39 / 1.90 / 1.78 / 1.48 |
+| 32768 | fwd / bwd / full / infer | 4.989 / 19.836 / 24.410 / 5.145 | 3.369 / 9.192 / 12.275 / 3.277 | 1.48 / 2.16 / 1.99 / 1.57 |
+
+(The H100-shipped optimizations carry over: full-step 1.7-2.0× vs v0 on B300 vs 1.4-1.9× on
+H100.) Peak memory identical to H100 runs (same allocation structure). During tuning,
+ptxas-blackwell also hard-crashed on one up_proj config
+("Register allocation failed with register count of '255'") — caught+skipped by the
+autotuner like the smem OOMs; noted as toolchain fragility.
+
+Per-kernel profile of v15 @T=8192 full (µs, % of 3057 total): dW1 652 (21%), bwd_down 614
+(20%), up_proj 523 (17%), dX 442 (15%), dW2 392 (13%), down_proj 307 (10%), gather 98×2 (3%).
+Effective TFLOPS: dX 932 (BN=256 single-dot — best), up_proj 788 (two-acc structure halves
+usable TMEM tile width), down_proj 671, dW1 632, dW2 526, bwd_down 336 (epilogue-bound:
+~1 GB of pre_act/d_pre_act/wact traffic + dS atomics after the MMA loop).
+
+### Probe results that re-rank the E18 backlog (all on B300, triton 3.7.1)
+
+- **TMA gather4 (`desc.gather`) ≈ pointer gathers, WS slower** (`probe_gather_b300.py`,
+  up-proj-shaped gathered GEMM, M=8192): ptr 0.042 ms, gather 0.046 ms, gather+WS 0.046-0.081 ms.
+  E18 #1 (WS + gather4) is a LOSS on this toolchain → dropped without a kernel-level variant.
+- **num_ctas=2 loses ~10% and miscompiles with BM=256** (`probe_ctas_bigm.py`, PassManager
+  crash) → E18 #3 (cluster multicast) dropped.
+- **BM=256 loses to BM=128 + BN=256** (870 vs 1103 TFLOPS on the gathered-GEMM probe;
+  M=65536, N=768, K=2048) → E18 #2's BLOCK_M raise dropped; the winning direction is
+  wide-N tiles + deeper pipelines with BM=128 (TMEM holds the accumulator either way).
+- Autotune-selected configs on B300 (v15, `probe_best_configs.py`): the GEMM kernels pick
+  ns=4-5 and BN=128-256 — already at the edge of the H100-era config space → widen it.
+
+### E20 — V16 `v16_bwtune`: Blackwell-gated autotune config spaces (retunes E5/E12/E13, L2 part of E18 #4)
+
+Hypothesis: the H100-tuned config space underserves sm103 — TMEM accumulators make BN=256
+"free", tcgen05 issue style makes nw=4 viable, HBM3e + 132 MB L2 favor deep-K dW tiles and
+bigger GROUP_M. Gate: `cap[0] == 10` (sm100/sm103 only; sm120 consumer has no TMEM and would
+waste tuning time), Hopper/Ampere spaces byte-identical. Adds: 10 GEMM configs (BN=256
+nw=4/ns=3-5, BK=128 ns=3-4, 2× GROUP_M=16), 8 dW configs (BK=128, ns=4, GROUP_M=8),
+BLOCK_H=1024 token-gather rows. Expected: 5-15% on the GEMM-bound modes.
+
+Result (`results/b300_e20_v16_vs_v15.txt`): **~neutral** — +5% fwd @8192, +3% infer @32768,
++1% full @8192/@32768, −9% fwd @128 (see below), everything else ±1%. correctness PASS.
+The H100 wide-tile extras (E12) already covered the configs sm103 wants; the NEW configs
+rarely beat them (autotuner picked the same winners at the probed sizes). The T=128 fwd wobble
+is tuning noise on a 0.3 ms op (do_bench re-picks between runs; v16@128 later re-measured
+0.29 ms). Verdict: MIXED-KEEP — the config additions are free where neutral, help fwd at
+large T, and the gate keeps other archs untouched. Learnings: on B300 the *shape* of the
+kernel (single-dot vs two-dot, epilogue weight) limits throughput, not the tile config —
+attack the epilogue next.
+
+### E21 — TMA weight-load A/B on B300 (extends E6): KEEP TMA
+
+Same v16 code, TMA on vs `_tma_eligibility` forced False (separate module instances so each
+arm autotunes for its own USE_TMA constexpr). `results/b300_e21_tma_ab.txt`:
+TMA wins at large T — fwd @32768 1.05×, infer @32768 1.03×, full @8192/@32768 1.02×; loses
+slightly at T=1024 fwd (0.95×, weight-read-bound regime where descriptor setup overhead
+shows). Net: keep the existing cap≥9 auto-enable unchanged. The E17 prediction ("B200
+auto-enables, would want revalidation") holds up: TMA is worth less on B300 (2-5%) than on
+H100 (6-9%) because the 132 MB L2 already absorbs most weight re-reads.
+
+### E22 — V17 `v17_epilogue`: evict-first hints on cross-pass activation traffic
+
+Hypothesis: `_moe_bwd_down_proj_kernel` runs at 336 effective TFLOPS (worst of all six) not
+because of its MMA loop but its epilogue: per step at T=8192 it loads pre_act (402 MB,
+read-once), stores d_pre_act (402 MB) + weighted_act (201 MB) — ~1 GB of dead-on-arrival L2
+traffic that evicts the W2 tiles and gathered dO rows other resident CTAs still need.
+Similarly the forward up-proj stores pre_act (402 MB) that nothing reads until backward,
+polluting L2 for the immediately-following down-proj (which re-reads post_act). Change:
+`eviction_policy="evict_first"` on (a) bwd_down epilogue pre_act loads + d_pre_act/wact
+stores, (b) up-proj pre_act stores — both only when the (TK, 2I) buffer exceeds the device
+L2 size (host-computed flag, new autotune key) and only on Blackwell-DC (unmeasured on
+Hopper → other archs compile the exact old path). Expected: 5-15% on backward @T≥8192, small
+fwd gain; neutral at small T (flag off below ~43K tokens·K on B300).
+
+Result (`results/b300_e22_v17_vs_v16.txt`): **REJECTED** — backward/full ±1% everywhere
+(0.99× bwd @8192), fwd +2% @8192 but −3% infer @8192, −11% fwd @1024 (noise band on a 0.3 ms
+op, but no upside to justify it). Learnings: sm103's L2 replacement policy already handles
+streaming stores well (the H100-era `evict_first` on gathered x rows survives in the shipped
+kernel because it was measured there; adding more hints on B300 buys nothing). The
+bwd_down 336-TFLOPS ceiling is NOT L2 displacement; it's plain HBM traffic + the serial
+epilogue dependency chain. NB: between E20 and E22 the absolute numbers drifted (bwd @8192
+2.66→2.15 ms) — the dW kernels tuned at a different first-seen T; see E24.
+
+### E23 — LIGER_FUSED_MOE_MEMORY_EFFICIENT on B300 (extends E7/E8): tradeoff unchanged, still opt-in
+
+`results/b300_e23_memeff.txt` (v15): full @8192 4.011 ms / 1665 MB vs default 3.032 ms /
+1953 MB; @32768 13.757 ms / 3205 MB vs 10.411 ms / 4357 MB. Same −288 MB / −1152 MB savings
+as H100, but the recompute now costs 32% / 32% on the full step (H100: 12-18%) — B300's
+faster MMAs make the extra pre_act reads in dW2 relatively more expensive. Default-off stays
+right on Blackwell; docs unchanged (the flag documents "~10-15% slower backward" per its
+H100 measurement — now arch-dependent, noted here).
+
+### E24 — V18 `v18_dwkey`: tokens-per-expert bucket in the dW autotune keys
+
+Hypothesis: `_moe_bwd_dW{1,2}_kernel` key their autotune caches on (H_dim, I_dim) only, so
+whichever T runs FIRST in a process pins the dW config for every later T. The optimum is
+regime-dependent (TK/E=64: output-write-bound, small tiles/parallelism; TK/E=2048+:
+K-loop-bound, deep-K tiles) — the E20↔E22 run-to-run drift (bwd @8192 2.66 vs 2.15 ms
+depending on which T tuned first) is direct evidence of the contamination. Mirror E5's
+per-BLOCK_M GEMM keys: add TPE_BUCKET = clamp(next_pow2(TK//E), 16, 4096) as a key-only
+constexpr on both dW kernels. Architecture-neutral, config spaces unchanged; costs one
+tuning pass per distinct bucket. Expected: recovers the ~0.5 ms/step backward drift at
+T=8192 deterministically; helps any variable-sequence-length training run.
+
+Result → **ACCEPTED**. Same-order A/B is neutral (±1%, `results/b300_e24_v18_vs_v16.txt`,
+both orders) — correct, since single-shape tuning conditions are identical. The realistic
+mixed-shape run (`results/b300_e24_v18_order128.txt`, T=128 tunes first as any warmup/unit
+test would): v16 bwd 2.615 / 9.032 ms @8192/@32768 vs v18 2.150 / 7.171 ms = **1.22× / 1.26×
+backward**. correctness PASS. Learnings: on B300 the dW1 kernel wants BK=128-deep tiles at
+large TK/E (an E20-added config) but BK=32 at small TK/E — the single shared cache entry was
+masking the E20 config-space win; E13 (deep-K dW) was "neutral" on H100 partly for this
+exact reason.
+
+v18 kernel breakdown @T=8192 full (µs of 2942): dW1 653 (22%), bwd_down 614 (21%), up_proj
+524 (18%), dX 394 (13%), dW2 371 (13%), down_proj 261 (9%), gather 96×2 (3%). Remaining
+structural ideas (split up-proj into single-dot GEMM + separate SwiGLU: ~2.5% expected but
+regresses inference memory; de-atomic dS: µs-level) are below the noise-vs-risk bar →
+stop the variant loop per the diminishing-returns rule. Ship = v15 fix + v16 config spaces
++ v18 keys (all three live in `variants/v18_dwkey.py`).
+
+### E25 — Ship to src + validation on B300
+
+Shipped to `src/liger_kernel/ops/fused_moe{,_kernels}.py`: (1) merged-K dX kernel (v15,
+unconditional — it is a correctness fix on sm100/sm103 and a neutral-to-positive
+simplification elsewhere); (2) Blackwell config-space extras (v16) as `_blackwell_config`-
+tagged entries that the `_make_tile_prune` hooks drop at launch when
+`infer_device_arch() not in ("blackwell", "blackwell_ultra")` — the arch check runs at
+first launch, NOT at import (importing liger_kernel must not initialize CUDA), and other
+archs keep byte-identical search spaces; (3) TPE_BUCKET dW autotune keys (v18, arch-neutral);
+(4) BLOCK_H=1024 token-gather configs (universal).
+
+Validation:
+- `pytest test/transformers/test_fused_moe.py`: **22 passed** (19:00, autotune-dominated) —
+  the suite that FAILED at E19 on the unmodified checkout.
+- `make checkstyle`: green. CPU-only import smoke test: OK (no CUDA touch at import).
+- `LIGER_FUSED_MOE_AUTOTUNE=0` pinned-config path: correctness PASS.
+- Per-config dX sweep post-fix (`probe_src_dx_configs.py`): all runnable configs correct
+  across {research shape, mini-model shape} × {fp32, bf16} × {TMA on/off}.
+- fp32 convergence `test_mini_model[mini_qwen3_moe]`: PASS.
+- Robustness (`results/b300_robustness.txt`): skew=1.5 full **1.65×** vs v0; Mixtral-8x7B
+  shape fwd **1.45×** / full **1.62×**; CUDA-graph inference capture+replay and
+  `make_graphed_callables` fwd+bwd both OK.
+- `benchmark/data/all_benchmark_data.csv` refreshed with B300 rows for both sweep dims
+  (T and num_experts); H100 rows retained (gpu_name column distinguishes).
+
+**Known-issue note (pre-existing, NOT this kernel):** bf16 convergence
+`test_mini_model[mini_qwen3_moe]` fails on this B300 box with 2 of 32 loss steps outside
+rtol=0.2 (late steps 29-32) — identically on the pristine aeab3e3 checkout. The convergence
+suite never exercises fused_moe (no `fused_moe` reference in `monkey_patch.py`; the MoE
+block runs stock HF + LigerQwen3MoeSwiGLUMLP), the same test passes in fp32 and the dense
+mini_qwen3 passes in bf16, so this is late-step bf16 training chaos under tcgen05
+accumulation order vs the H100-calibrated tolerances — upstream tolerance work, out of
+scope here.
+
+**Environment gotcha (documented for the next box):** this AMI exports
+`LD_LIBRARY_PATH=/usr/local/cuda/...` (system CUDA 13.2), which mid-session started
+shadowing the pip `nvidia-cublas` (13.1) libraries and crashed every cuBLASLt user with
+"Invalid handle. Cannot load symbol cublasLtGetVersion" (torch matmul → abort). All
+validation above ran with `LD_LIBRARY_PATH=` cleared; the Triton kernels themselves are
+unaffected (no cuBLAS dependency).
+
+## FINAL RESULT (Phase B, B300)
+
+PR-#1179 baseline (v0) → shipped src on B300 (`results/b300_final_vs_v0.txt`), Qwen3-MoE-30B
+shard, bf16, same harness as the H100 table at the top of this file:
+
+| T | fwd | bwd | full step | inference fwd |
+|---|-----|-----|-----------|---------------|
+| 128 | 0.353→0.304 (**1.16×**) | 0.938→0.553 (**1.70×**) | 1.314→0.774 (**1.70×**) | 0.352→0.285 (**1.24×**) |
+| 1024 | 0.395→0.312 (**1.27×**) | 1.310→0.738 (**1.78×**) | 1.719→1.023 (**1.68×**) | 0.396→0.289 (**1.37×**) |
+| 8192 | 1.323→0.924 (**1.43×**) | 5.060→2.150 (**2.35×**) | 6.351→3.066 (**2.07×**) | 1.337→0.923 (**1.45×**) |
+| 32768 | 4.994→3.152 (**1.58×**) | 19.829→7.147 (**2.77×**) | 24.345→10.344 (**2.35×**) | 5.100→3.201 (**1.59×**) |
+
+vs the H100 final (same code lineage): full step @32768 19.005→10.344 ms box-to-box, and
+the *relative* win over v0 grew from 1.91× (H100) to 2.35× (B300). Peak memory unchanged.
+And unlike the checkout this phase started from, **the gradients are right**: the headline
+deliverable is the sm103 miscompile fix (E19) — everything on Blackwell silently trained on
+wrong dx before it.
+
+Phase B experiment ledger: E19 fix (shipped), E20 config spaces (shipped), E21 TMA A/B
+(keep, no change), E22 eviction hints (REJECTED), E23 memeff cost re-measure (docs only),
+E24 dW keys (shipped, 1.22-1.26× bwd in mixed-shape runs), E25 ship+validate. Base rate
+this phase: 2 of 4 measured hypotheses shipped; the E18 backlog's top three ideas
+(WS+gather4, BM=256, clusters) all died in probes before reaching a variant — cheap kills,
+exactly what the probe-first ordering is for.

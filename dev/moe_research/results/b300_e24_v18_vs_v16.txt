@@ -1,0 +1,9 @@
+
+config: E=128 H=2048 I=768 K=8 dtype=bf16 skew=0.0
+      T      mode                  v16_bwtune.py                   v18_dwkey.py
+   1024  backward              0.738 ms ( 1.00x)              0.739 ms ( 1.00x)
+   1024      full              1.020 ms ( 1.00x)              1.020 ms ( 1.00x)
+   8192  backward              2.153 ms ( 1.00x)              2.150 ms ( 1.00x)
+   8192      full              3.055 ms ( 1.00x)              3.096 ms ( 0.99x)
+  32768  backward              7.196 ms ( 1.00x)              7.157 ms ( 1.01x)
+  32768      full             10.265 ms ( 1.00x)             10.495 ms ( 0.98x)

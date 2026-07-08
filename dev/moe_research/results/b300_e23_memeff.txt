@@ -1,0 +1,2 @@
+T=  8192 full: memeff=  4.011 ms   peak-mem=   1665 MB
+T= 32768 full: memeff= 13.757 ms   peak-mem=   3205 MB
