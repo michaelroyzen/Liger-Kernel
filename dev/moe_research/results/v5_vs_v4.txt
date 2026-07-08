@@ -1,0 +1,15 @@
+[check] variants/v4_dw_swizzle.py
+  correctness: PASS
+[check] variants/v5_adaptive.py
+  correctness: PASS
+
+config: E=128 H=2048 I=768 K=8 dtype=bf16 skew=0.0
+      T      mode               v4_dw_swizzle.py                 v5_adaptive.py
+    128   forward              0.450 ms ( 1.00x)              0.449 ms ( 1.00x)
+    128      full              1.301 ms ( 1.00x)              1.283 ms ( 1.01x)
+   1024   forward              0.507 ms ( 1.00x)              0.508 ms ( 1.00x)
+   1024      full              1.652 ms ( 1.00x)              1.655 ms ( 1.00x)
+   8192   forward              1.964 ms ( 1.00x)              1.531 ms ( 1.28x)
+   8192      full              6.038 ms ( 1.00x)              5.566 ms ( 1.08x)
+  32768   forward              7.360 ms ( 1.00x)              5.696 ms ( 1.29x)
+  32768      full             22.646 ms ( 1.00x)             20.095 ms ( 1.13x)

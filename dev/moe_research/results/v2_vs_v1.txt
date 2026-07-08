@@ -1,0 +1,9 @@
+[check] variants/v1_nosync.py
+  correctness: PASS
+[check] variants/v2_nomemset.py
+  correctness: PASS
+
+config: E=128 H=2048 I=768 K=8 dtype=bf16 skew=0.0
+      T      mode                   v1_nosync.py                 v2_nomemset.py
+    128      full              1.699 ms ( 1.00x)              1.325 ms ( 1.28x)
+   8192      full              9.774 ms ( 1.00x)              9.461 ms ( 1.03x)

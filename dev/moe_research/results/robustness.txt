@@ -1,0 +1,48 @@
+/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/torch/autograd/graph.py:882: UserWarning: The AccumulateGrad node's stream does not match the stream of the node that produced the incoming gradient. This may incur unnecessary synchronization and break CUDA graph capture if the AccumulateGrad node's stream is the default stream. This mismatch is caused by an AccumulateGrad node created prior to the current iteration being kept alive. This can happen if the autograd graph is still being kept alive by tensors such as the loss, or if you are using DDP, which will stash a reference to the node. To resolve the mismatch, delete all references to the autograd graph or ensure that DDP initialization is performed under the same stream as subsequent forwards. If the mismatch is intentional, you can use torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False) to suppress this warning. (Triggered internally at /pytorch/torch/csrc/autograd/input_buffer.cpp:240.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+
+=== Qwen3-30B skewed routing (skew=1.5) ===
+T=  8192 E=128 H=2048 I=  768 K=8  forward: v0=  2.073 ms  v8=  1.514 ms  (1.37x)
+T=  8192 E=128 H=2048 I=  768 K=8     full: v0=  7.710 ms  v8=  5.340 ms  (1.44x)
+
+=== Mixtral-8x7B shape (skew=0.0) ===
+T=  4096 E=  8 H=4096 I=14336 K=2  forward: v0=  7.569 ms  v8=  5.574 ms  (1.36x)
+T=  4096 E=  8 H=4096 I=14336 K=2     full: v0= 27.501 ms  v8= 23.084 ms  (1.19x)
+
+=== CUDA graph capture (v8, sync-free) ===
+inference capture+replay: OK
+Traceback (most recent call last):
+  File "/home/ubuntu/Liger-Kernel/dev/moe_research/robustness.py", line 63, in cudagraph_test
+    grads = torch.autograd.grad(y, (x, gup, dn, wts), dO)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/torch/autograd/__init__.py", line 530, in grad
+    result = _engine_run_backward(
+             ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/torch/autograd/graph.py", line 882, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.AcceleratorError: CUDA error: operation would make the legacy stream depend on a capturing blocking stream
+Search for `cudaErrorStreamCaptureImplicit' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/ubuntu/Liger-Kernel/dev/moe_research/robustness.py", line 76, in <module>
+    cudagraph_test()
+  File "/home/ubuntu/Liger-Kernel/dev/moe_research/robustness.py", line 61, in cudagraph_test
+    with torch.cuda.graph(g2):
+         ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/torch/cuda/graphs.py", line 283, in __exit__
+    self.cuda_graph.capture_end()
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/torch/cuda/graphs.py", line 126, in capture_end
+    super().capture_end()
+torch.AcceleratorError: CUDA error: operation failed due to a previous error during capture
+Search for `cudaErrorStreamCaptureInvalidated' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+

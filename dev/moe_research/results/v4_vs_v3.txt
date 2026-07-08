@@ -1,0 +1,10 @@
+[check] variants/v3_swizzle.py
+  correctness: PASS
+[check] variants/v4_dw_swizzle.py
+  correctness: PASS
+
+config: E=128 H=2048 I=768 K=8 dtype=bf16 skew=0.0
+      T      mode                  v3_swizzle.py               v4_dw_swizzle.py
+   1024  backward              1.156 ms ( 1.00x)              1.133 ms ( 1.02x)
+   8192  backward              4.614 ms ( 1.00x)              3.846 ms ( 1.20x)
+  32768  backward             16.843 ms ( 1.00x)             14.401 ms ( 1.17x)

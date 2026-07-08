@@ -1,0 +1,7 @@
+
+config: E=128 H=2048 I=768 K=8 dtype=bf16 skew=0.0
+      T      mode                     v8_best.py
+   8192      full              5.926 ms ( 1.00x)
+  32768      full             22.156 ms ( 1.00x)
+[mem full] T=8192: v8_best.py: 1665 MB
+[mem full] T=32768: v8_best.py: 3205 MB

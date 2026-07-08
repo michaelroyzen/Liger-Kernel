@@ -1,0 +1,16 @@
+[check] variants/v5_adaptive.py
+  correctness: PASS
+[check] variants/v7_mempack.py
+  correctness: PASS
+
+config: E=128 H=2048 I=768 K=8 dtype=bf16 skew=0.0
+      T      mode                 v5_adaptive.py                  v7_mempack.py
+   1024   forward              0.508 ms ( 1.00x)              0.509 ms ( 1.00x)
+   1024      full              1.649 ms ( 1.00x)              1.765 ms ( 0.93x)
+   8192   forward              1.563 ms ( 1.00x)              1.531 ms ( 1.02x)
+   8192      full              5.288 ms ( 1.00x)              5.840 ms ( 0.91x)
+  32768   forward              5.574 ms ( 1.00x)              5.423 ms ( 1.03x)
+  32768      full             18.927 ms ( 1.00x)             21.917 ms ( 0.86x)
+[mem full] T=1024: v5_adaptive.py: 1252 MB | v7_mempack.py: 0 MB
+[mem full] T=8192: v5_adaptive.py: 1953 MB | v7_mempack.py: 1665 MB
+[mem full] T=32768: v5_adaptive.py: 4356 MB | v7_mempack.py: 3205 MB

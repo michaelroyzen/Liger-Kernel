@@ -1,0 +1,13 @@
+[check] variants/v5_adaptive.py
+  correctness: PASS
+[check] variants/v6_tma.py
+  correctness: PASS
+
+config: E=128 H=2048 I=768 K=8 dtype=bf16 skew=0.0
+      T      mode                 v5_adaptive.py                      v6_tma.py
+   1024   forward              0.510 ms ( 1.00x)              0.510 ms ( 1.00x)
+   1024      full              1.640 ms ( 1.00x)              1.664 ms ( 0.99x)
+   8192   forward              1.577 ms ( 1.00x)              1.487 ms ( 1.06x)
+   8192      full              5.299 ms ( 1.00x)              5.294 ms ( 1.00x)
+  32768   forward              5.540 ms ( 1.00x)              5.250 ms ( 1.06x)
+  32768      full             20.630 ms ( 1.00x)             18.947 ms ( 1.09x)

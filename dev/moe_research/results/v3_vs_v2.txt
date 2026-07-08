@@ -1,0 +1,13 @@
+[check] variants/v2_nomemset.py
+  correctness: PASS
+[check] variants/v3_swizzle.py
+  correctness: PASS
+
+config: E=128 H=2048 I=768 K=8 dtype=bf16 skew=0.0
+      T      mode                 v2_nomemset.py                  v3_swizzle.py
+   1024   forward              0.543 ms ( 1.00x)              0.511 ms ( 1.06x)
+   1024      full              1.779 ms ( 1.00x)              1.672 ms ( 1.06x)
+   8192   forward              2.044 ms ( 1.00x)              1.939 ms ( 1.05x)
+   8192      full              8.012 ms ( 1.00x)              6.650 ms ( 1.20x)
+  32768   forward              8.367 ms ( 1.00x)              7.298 ms ( 1.15x)
+  32768      full             30.846 ms ( 1.00x)             24.333 ms ( 1.27x)

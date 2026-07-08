@@ -1,0 +1,5 @@
+
+config: E=128 H=2048 I=768 K=8 dtype=bf16 skew=0.0
+      T      mode                v11_bigtiles.py                v13_splitbwd.py
+   8192      full              5.272 ms ( 1.00x)              5.197 ms ( 1.01x)
+  32768      full             17.930 ms ( 1.00x)             18.079 ms ( 0.99x)

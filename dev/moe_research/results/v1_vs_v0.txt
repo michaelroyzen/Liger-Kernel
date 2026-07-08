@@ -1,0 +1,13 @@
+[check] variants/v0_baseline.py
+  correctness: PASS
+[check] variants/v1_nosync.py
+  correctness: PASS
+
+config: E=128 H=2048 I=768 K=8 dtype=bf16 skew=0.0
+      T      mode                 v0_baseline.py                   v1_nosync.py
+    128   forward              0.557 ms ( 1.00x)              0.455 ms ( 1.22x)
+    128      full              1.832 ms ( 1.00x)              1.704 ms ( 1.08x)
+   1024   forward              0.646 ms ( 1.00x)              0.551 ms ( 1.17x)
+   1024      full              2.419 ms ( 1.00x)              2.236 ms ( 1.08x)
+   8192   forward              2.646 ms ( 1.00x)              2.557 ms ( 1.03x)
+   8192      full              9.939 ms ( 1.00x)              9.791 ms ( 1.02x)

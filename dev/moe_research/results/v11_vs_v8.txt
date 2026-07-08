@@ -1,0 +1,7 @@
+
+config: E=128 H=2048 I=768 K=8 dtype=bf16 skew=0.0
+      T      mode                     v8_best.py                v11_bigtiles.py
+   8192   forward              1.587 ms ( 1.00x)              1.488 ms ( 1.07x)
+   8192      full              5.179 ms ( 1.00x)              5.177 ms ( 1.00x)
+  32768   forward              5.167 ms ( 1.00x)              5.259 ms ( 0.98x)
+  32768      full             19.049 ms ( 1.00x)             18.523 ms ( 1.03x)

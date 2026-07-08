@@ -1,0 +1,5 @@
+
+config: E=128 H=2048 I=768 K=8 dtype=bf16 skew=0.0
+      T      mode                 v0_baseline.py                     v8_best.py
+   1024     infer              0.632 ms ( 1.00x)              0.501 ms ( 1.26x)
+   8192     infer              2.183 ms ( 1.00x)              1.459 ms ( 1.50x)

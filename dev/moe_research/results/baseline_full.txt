@@ -1,0 +1,97 @@
+/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-07-08 02:58:39 22287:22287 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-07-08 02:58:39 22287:22287 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-07-08 02:58:39 22287:22287 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-07-08 02:58:39 22287:22287 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-07-08 02:58:39 22287:22287 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-07-08 02:58:39 22287:22287 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-07-08 02:58:39 22287:22287 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-07-08 02:58:40 22287:22287 ActivityProfilerController.cpp:455] profiler_stop
+
+config: E=128 H=2048 I=768 K=8 dtype=bf16 skew=0.0
+      T      mode                 v0_baseline.py
+    128   forward              0.551 ms ( 1.00x)
+    128  backward              1.252 ms ( 1.00x)
+    128      full              1.825 ms ( 1.00x)
+   1024   forward              0.645 ms ( 1.00x)
+   1024  backward              1.698 ms ( 1.00x)
+   1024      full              2.361 ms ( 1.00x)
+   8192   forward              2.646 ms ( 1.00x)
+   8192  backward              7.187 ms ( 1.00x)
+   8192      full              9.894 ms ( 1.00x)
+  32768   forward              9.900 ms ( 1.00x)
+  32768  backward             26.157 ms ( 1.00x)
+  32768      full             36.190 ms ( 1.00x)
+[mem full] T=128: v0_baseline.py: 1165 MB
+[mem full] T=1024: v0_baseline.py: 1252 MB
+[mem full] T=8192: v0_baseline.py: 1953 MB
+[mem full] T=32768: v0_baseline.py: 4356 MB
+
+[profile full] variants/v0_baseline.py T=128
+kernel                                                                      us/iter  count      %
+void at::native::vectorized_elementwise_kernel<8, at::native::FillFuncto      366.6      4   21.8
+_fused_up_proj_swiglu_kernel                                                  278.9      1   16.6
+_moe_bwd_dW1_kernel                                                           277.8      1   16.5
+_moe_bwd_dX_expanded_kernel                                                   277.3      1   16.5
+_moe_bwd_down_proj_kernel                                                     162.3      1    9.7
+_moe_bwd_dW2_kernel                                                           144.0      1    8.6
+_fused_down_proj_kernel                                                       141.1      1    8.4
+_token_gather_weighted_sum_kernel                                               9.4      2    0.6
+_moe_router_scatter_kernel                                                      7.5      1    0.4
+_moe_router_histogram_kernel                                                    7.5      1    0.4
+void at::native::reduce_kernel<128, 4, at::native::ReduceOp<int, at::nat        4.2      1    0.2
+Memcpy DtoH (Device -> Pinned)                                                  1.6      1    0.1
+_moe_router_prefix_sum_kernel                                                   1.5      1    0.1
+TOTAL                                                                        1679.7
+
+[profile full] variants/v0_baseline.py T=1024
+kernel                                                                      us/iter  count      %
+_moe_bwd_dW1_kernel                                                           479.4      1   21.5
+_moe_bwd_dX_expanded_kernel                                                   369.4      1   16.6
+void at::native::vectorized_elementwise_kernel<8, at::native::FillFuncto      367.7      4   16.5
+_fused_up_proj_swiglu_kernel                                                  310.9      1   13.9
+_moe_bwd_dW2_kernel                                                           248.1      1   11.1
+_moe_bwd_down_proj_kernel                                                     209.7      1    9.4
+_fused_down_proj_kernel                                                       193.5      1    8.7
+_token_gather_weighted_sum_kernel                                              27.6      2    1.2
+_moe_router_histogram_kernel                                                    8.4      1    0.4
+_moe_router_scatter_kernel                                                      8.3      1    0.4
+void at::native::reduce_kernel<512, 1, at::native::ReduceOp<int, at::nat        2.5      1    0.1
+Memcpy DtoH (Device -> Pinned)                                                  1.7      1    0.1
+_moe_router_prefix_sum_kernel                                                   1.6      1    0.1
+TOTAL                                                                        2228.6
+
+[profile full] variants/v0_baseline.py T=8192
+kernel                                                                      us/iter  count      %
+_moe_bwd_dW1_kernel                                                          2268.8      1   23.4
+_moe_bwd_dX_expanded_kernel                                                  1935.7      1   19.9
+_moe_bwd_dW2_kernel                                                          1566.9      1   16.1
+_fused_down_proj_kernel                                                      1296.7      1   13.4
+_fused_up_proj_swiglu_kernel                                                 1102.7      1   11.4
+_moe_bwd_down_proj_kernel                                                     931.8      1    9.6
+void at::native::vectorized_elementwise_kernel<8, at::native::FillFuncto      376.8      4    3.9
+_token_gather_weighted_sum_kernel                                             207.6      2    2.1
+_moe_router_histogram_kernel                                                    9.1      1    0.1
+_moe_router_scatter_kernel                                                      8.7      1    0.1
+void at::native::reduce_kernel<512, 1, at::native::ReduceOp<int, at::nat        2.6      1    0.0
+_moe_router_prefix_sum_kernel                                                   1.5      1    0.0
+Memcpy DtoH (Device -> Pinned)                                                  1.5      1    0.0
+TOTAL                                                                        9710.6
+
+[profile full] variants/v0_baseline.py T=32768
+kernel                                                                      us/iter  count      %
+_moe_bwd_dW1_kernel                                                          8818.6      1   24.5
+_moe_bwd_dX_expanded_kernel                                                  6995.3      1   19.5
+_moe_bwd_dW2_kernel                                                          5787.9      1   16.1
+_fused_down_proj_kernel                                                      4735.3      1   13.2
+_fused_up_proj_swiglu_kernel                                                 4548.0      1   12.7
+_moe_bwd_down_proj_kernel                                                    3829.7      1   10.7
+_token_gather_weighted_sum_kernel                                             791.4      2    2.2
+void at::native::vectorized_elementwise_kernel<8, at::native::FillFuncto      407.3      4    1.1
+_moe_router_scatter_kernel                                                     14.7      1    0.0
+_moe_router_histogram_kernel                                                   12.3      1    0.0
+void at::native::reduce_kernel<512, 1, at::native::ReduceOp<int, at::nat        2.7      1    0.0
+_moe_router_prefix_sum_kernel                                                   2.0      1    0.0
+Memcpy DtoH (Device -> Pinned)                                                  1.7      1    0.0
+TOTAL                                                                       35946.9

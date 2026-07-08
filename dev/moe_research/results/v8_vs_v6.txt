@@ -1,0 +1,12 @@
+
+config: E=128 H=2048 I=768 K=8 dtype=bf16 skew=0.0
+      T      mode                      v6_tma.py                     v8_best.py
+   1024   forward              0.509 ms ( 1.00x)              0.511 ms ( 1.00x)
+   1024      full              1.661 ms ( 1.00x)              1.660 ms ( 1.00x)
+   8192   forward              1.594 ms ( 1.00x)              1.519 ms ( 1.05x)
+   8192      full              5.350 ms ( 1.00x)              5.275 ms ( 1.01x)
+  32768   forward              5.195 ms ( 1.00x)              5.297 ms ( 0.98x)
+  32768      full             20.592 ms ( 1.00x)             18.772 ms ( 1.10x)
+[mem full] T=1024: v6_tma.py: 1252 MB | v8_best.py: 0 MB
+[mem full] T=8192: v6_tma.py: 1953 MB | v8_best.py: 1761 MB
+[mem full] T=32768: v6_tma.py: 4356 MB | v8_best.py: 3589 MB

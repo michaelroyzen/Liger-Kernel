@@ -1,0 +1,193 @@
+python: /project/third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/TaskIdPropagation.cpp:162: virtual void mlir::triton::gpu::TaskIdBackwardPropagation::visitBranchOperand(OpOperand &): Assertion `isa<scf::IfOp>(defOp) || isa<scf::ForOp>(defOp)' failed.
+module {
+  tt.func public @_fused_up_proj_swiglu_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg3: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg4: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg5: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg6: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg7: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg8: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg9: i32 {tt.divisibility = 16 : i32}, %arg10: i32 {tt.divisibility = 16 : i32}, %arg11: i32 {tt.divisibility = 16 : i32}, %arg12: i32 {tt.divisibility = 16 : i32}, %arg13: i32 {tt.divisibility = 16 : i32}, %arg14: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %cst = arith.constant dense<1.000000e+00> : tensor<128x64xf32>
+    %cst_0 = arith.constant dense<0.000000e+00> : tensor<128x64xf32>
+    %c16_i32 = arith.constant 16 : i32
+    %c8_i32 = arith.constant 8 : i32
+    %c32_i32 = arith.constant 32 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %cst_1 = arith.constant dense<128> : tensor<128x64xi32>
+    %cst_2 = arith.constant dense<0.000000e+00> : tensor<128x32xf32>
+    %cst_3 = arith.constant dense<256> : tensor<32xi32>
+    %cst_4 = arith.constant dense<0> : tensor<128xi32>
+    %c256_i64 = arith.constant 256 : i64
+    %c1_i64 = arith.constant 1 : i64
+    %c256_i32 = arith.constant 256 : i32
+    %cst_5 = arith.constant dense<128> : tensor<64xi32>
+    %c128_i32 = arith.constant 128 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c64_i32 = arith.constant 64 : i32
+    %c2_i32 = arith.constant 2 : i32
+    %0 = tt.get_program_id x : i32
+    %1 = tt.load %arg6 : !tt.ptr<i32>
+    %2 = arith.muli %1, %c2_i32 : i32
+    %3 = arith.cmpi sge, %0, %2 : i32
+    cf.cond_br %3, ^bb1, ^bb2
+  ^bb1:  // pred: ^bb0
+    tt.return
+  ^bb2:  // pred: ^bb0
+    %4 = arith.divsi %0, %c16_i32 : i32
+    %5 = arith.muli %4, %c8_i32 : i32
+    %6 = arith.subi %1, %5 : i32
+    %7 = arith.minsi %6, %c8_i32 : i32
+    %8 = arith.remsi %0, %c16_i32 : i32
+    %9 = arith.remsi %8, %7 : i32
+    %10 = arith.addi %5, %9 : i32
+    %11 = arith.divsi %8, %7 : i32
+    %12 = tt.addptr %arg4, %10 : !tt.ptr<i32>, i32
+    %13 = tt.load %12 : !tt.ptr<i32>
+    %14 = tt.addptr %arg5, %10 : !tt.ptr<i32>, i32
+    %15 = tt.load %14 : !tt.ptr<i32>
+    %16 = arith.extsi %15 : i32 to i64
+    %17 = arith.muli %11, %c64_i32 : i32
+    %18 = tt.addptr %arg3, %16 : !tt.ptr<i32>, i64
+    %19 = tt.addptr %18, %c1_i32 : !tt.ptr<i32>, i32
+    %20 = tt.load %19 : !tt.ptr<i32>
+    %21 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>
+    %22 = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
+    %23 = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32>
+    %24 = tt.splat %13 : i32 -> tensor<128xi32>
+    %25 = arith.addi %24, %21 : tensor<128xi32>
+    %26 = arith.extsi %25 : tensor<128xi32> to tensor<128xi64>
+    %27 = arith.extsi %20 : i32 to i64
+    %28 = tt.splat %27 : i64 -> tensor<128xi64>
+    %29 = arith.cmpi slt, %26, %28 : tensor<128xi64>
+    %30 = tt.splat %17 : i32 -> tensor<64xi32>
+    %31 = arith.addi %30, %22 : tensor<64xi32>
+    %32 = arith.cmpi slt, %31, %cst_5 : tensor<64xi32>
+    %33 = arith.extsi %arg12 : i32 to i64
+    %34 = tt.make_tensor_descriptor %arg1, [%arg9, %c256_i32], [%33, %c1_i64] : <f32>, <tensor<64x32xf32>>
+    %35 = arith.muli %16, %c256_i64 : i64
+    %36 = arith.trunci %35 : i64 to i32
+    %37 = arith.addi %36, %17 : i32
+    %38 = tt.splat %arg2 : !tt.ptr<i32> -> tensor<128x!tt.ptr<i32>>
+    %39 = tt.addptr %38, %26 : tensor<128x!tt.ptr<i32>>, tensor<128xi64>
+    %40 = tt.load %39, %29, %cst_4 : tensor<128x!tt.ptr<i32>>
+    %41 = arith.extsi %40 : tensor<128xi32> to tensor<128xi64>
+    %42:2 = scf.for %arg15 = %c0_i32 to %c256_i32 step %c32_i32 iter_args(%arg16 = %cst_0, %arg17 = %cst_0) -> (tensor<128x64xf32>, tensor<128x64xf32>)  : i32 {
+      %72 = tt.splat %arg15 : i32 -> tensor<32xi32>
+      %73 = arith.addi %72, %23 : tensor<32xi32>
+      %74 = arith.cmpi slt, %73, %cst_3 : tensor<32xi32>
+      %75 = tt.expand_dims %41 {axis = 1 : i32} : tensor<128xi64> -> tensor<128x1xi64>
+      %76 = arith.extsi %arg10 : i32 to i64
+      %77 = tt.splat %76 : i64 -> tensor<128x1xi64>
+      %78 = arith.muli %75, %77 : tensor<128x1xi64>
+      %79 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<128x1x!tt.ptr<f32>>
+      %80 = tt.addptr %79, %78 : tensor<128x1x!tt.ptr<f32>>, tensor<128x1xi64>
+      %81 = tt.expand_dims %73 {axis = 0 : i32} : tensor<32xi32> -> tensor<1x32xi32>
+      %82 = tt.broadcast %80 : tensor<128x1x!tt.ptr<f32>> -> tensor<128x32x!tt.ptr<f32>>
+      %83 = tt.broadcast %81 : tensor<1x32xi32> -> tensor<128x32xi32>
+      %84 = tt.addptr %82, %83 : tensor<128x32x!tt.ptr<f32>>, tensor<128x32xi32>
+      %85 = tt.expand_dims %29 {axis = 1 : i32} : tensor<128xi1> -> tensor<128x1xi1>
+      %86 = tt.expand_dims %74 {axis = 0 : i32} : tensor<32xi1> -> tensor<1x32xi1>
+      %87 = tt.broadcast %85 : tensor<128x1xi1> -> tensor<128x32xi1>
+      %88 = tt.broadcast %86 : tensor<1x32xi1> -> tensor<128x32xi1>
+      %89 = arith.andi %87, %88 : tensor<128x32xi1>
+      %90 = tt.load %84, %89, %cst_2 evictionPolicy = evict_first : tensor<128x32x!tt.ptr<f32>>
+      %91 = tt.descriptor_load %34[%37, %arg15] : !tt.tensordesc<tensor<64x32xf32>> -> tensor<64x32xf32>
+      %92 = tt.trans %91 {order = array<i32: 1, 0>} : tensor<64x32xf32> -> tensor<32x64xf32>
+      %93 = tt.dot %90, %92, %arg16, inputPrecision = tf32 : tensor<128x32xf32> * tensor<32x64xf32> -> tensor<128x64xf32>
+      %94 = arith.addi %37, %c128_i32 : i32
+      %95 = tt.descriptor_load %34[%94, %arg15] : !tt.tensordesc<tensor<64x32xf32>> -> tensor<64x32xf32>
+      %96 = tt.trans %95 {order = array<i32: 1, 0>} : tensor<64x32xf32> -> tensor<32x64xf32>
+      %97 = tt.dot %90, %96, %arg17, inputPrecision = tf32 : tensor<128x32xf32> * tensor<32x64xf32> -> tensor<128x64xf32>
+      scf.yield %93, %97 : tensor<128x64xf32>, tensor<128x64xf32>
+    } {tt.warp_specialize}
+    %43 = tt.expand_dims %29 {axis = 1 : i32} : tensor<128xi1> -> tensor<128x1xi1>
+    %44 = tt.expand_dims %32 {axis = 0 : i32} : tensor<64xi1> -> tensor<1x64xi1>
+    %45 = tt.broadcast %43 : tensor<128x1xi1> -> tensor<128x64xi1>
+    %46 = tt.broadcast %44 : tensor<1x64xi1> -> tensor<128x64xi1>
+    %47 = arith.andi %45, %46 : tensor<128x64xi1>
+    %48 = tt.expand_dims %26 {axis = 1 : i32} : tensor<128xi64> -> tensor<128x1xi64>
+    %49 = arith.extsi %arg13 : i32 to i64
+    %50 = tt.splat %49 : i64 -> tensor<128x1xi64>
+    %51 = arith.muli %48, %50 : tensor<128x1xi64>
+    %52 = tt.splat %arg7 : !tt.ptr<f32> -> tensor<128x1x!tt.ptr<f32>>
+    %53 = tt.addptr %52, %51 : tensor<128x1x!tt.ptr<f32>>, tensor<128x1xi64>
+    %54 = tt.expand_dims %31 {axis = 0 : i32} : tensor<64xi32> -> tensor<1x64xi32>
+    %55 = tt.broadcast %53 : tensor<128x1x!tt.ptr<f32>> -> tensor<128x64x!tt.ptr<f32>>
+    %56 = tt.broadcast %54 : tensor<1x64xi32> -> tensor<128x64xi32>
+    %57 = tt.addptr %55, %56 : tensor<128x64x!tt.ptr<f32>>, tensor<128x64xi32>
+    %58 = tt.addptr %57, %cst_1 : tensor<128x64x!tt.ptr<f32>>, tensor<128x64xi32>
+    tt.store %57, %42#0, %47 : tensor<128x64x!tt.ptr<f32>>
+    tt.store %58, %42#1, %47 : tensor<128x64x!tt.ptr<f32>>
+    %59 = arith.subf %cst_0, %42#0 : tensor<128x64xf32>
+    %60 = math.exp %59 : tensor<128x64xf32>
+    %61 = arith.addf %60, %cst : tensor<128x64xf32>
+    %62 = arith.divf %cst, %61 : tensor<128x64xf32>
+    %63 = arith.mulf %42#0, %62 : tensor<128x64xf32>
+    %64 = arith.mulf %63, %42#1 : tensor<128x64xf32>
+    %65 = arith.extsi %arg14 : i32 to i64
+    %66 = tt.splat %65 : i64 -> tensor<128x1xi64>
+    %67 = arith.muli %48, %66 : tensor<128x1xi64>
+    %68 = tt.splat %arg8 : !tt.ptr<f32> -> tensor<128x1x!tt.ptr<f32>>
+    %69 = tt.addptr %68, %67 : tensor<128x1x!tt.ptr<f32>>, tensor<128x1xi64>
+    %70 = tt.broadcast %69 : tensor<128x1x!tt.ptr<f32>> -> tensor<128x64x!tt.ptr<f32>>
+    %71 = tt.addptr %70, %56 : tensor<128x64x!tt.ptr<f32>>, tensor<128x64xi32>
+    tt.store %71, %64, %47 : tensor<128x64x!tt.ptr<f32>>
+    tt.return
+  }
+}
+
+{-#
+  external_resources: {
+    mlir_reproducer: {
+      pipeline: "builtin.module(convert-triton-to-tritongpu{enable-source-remat=false num-ctas=1 num-warps=4 target=cuda:90 threads-per-warp=32}, tritongpu-coalesce, tritongpu-F32DotTC{emu-tf32=true}, triton-nvidia-gpu-plan-cta, tritongpu-remove-layout-conversions, tritongpu-optimize-thread-locality, tritongpu-accelerate-matmul, tritongpu-remove-layout-conversions, tritongpu-optimize-dot-operands{hoist-layout-conversion=true}, triton-nvidia-optimize-descriptor-encoding, triton-loop-aware-cse, tritongpu-fuse-nested-loops, canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=normal test-convergence=false top-down=true}, triton-licm, canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=normal test-convergence=false top-down=true}, tritongpu-combine-tensor-select-and-if, nvgpu-warp-specialization{dump-intermediate-steps=false num-stages=2}, tritongpu-assign-latencies{num-stages=2}, tritongpu-schedule-loops, tritongpu-pipeline{dump-intermediate-steps=false num-stages=2}, canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=normal test-convergence=false top-down=true}, triton-loop-aware-cse, tritongpu-prefetch, tritongpu-optimize-dot-operands{hoist-layout-conversion=true}, tritongpu-coalesce-async-copy, triton-nvidia-optimize-tmem-layouts, triton-nvidia-tma-lowering, tritongpu-remove-layout-conversions, triton-nvidia-interleave-tmem, tritongpu-reduce-data-duplication, tritongpu-reorder-instructions, triton-loop-aware-cse, symbol-dce, triton-nvidia-gpu-fence-insertion{compute-capability=90}, triton-nvidia-mma-lowering, sccp, cse, canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=normal test-convergence=false top-down=true})",
+      disable_threading: true,
+      verify_each: true
+    }
+  }
+#-}
+/home/ubuntu/Liger-Kernel/dev/moe_research/variants/v9_ws.py:398:0: error: Failures have been detected while processing an MLIR pass pipeline
+/home/ubuntu/Liger-Kernel/dev/moe_research/variants/v9_ws.py:398:0: note: Pipeline failed while executing [`NVGPUWarpSpecialization` on 'builtin.module' operation]: reproducer generated at `std::errs, please share the reproducer above with Triton project.`
+[check] variants/v8_best.py
+  correctness: PASS
+[check] variants/v9_ws.py
+Traceback (most recent call last):
+  File "/home/ubuntu/Liger-Kernel/dev/moe_research/bench.py", line 86, in <module>
+    main()
+  File "/home/ubuntu/Liger-Kernel/dev/moe_research/bench.py", line 40, in main
+    ok = check_correctness(mod)
+         ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/Liger-Kernel/dev/moe_research/common.py", line 79, in check_correctness
+    out = fn(x2, gup2, dn2, idx, wts2)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/torch/autograd/function.py", line 596, in apply
+    return super().apply(*args, **kwargs)  # type: ignore[misc]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/Liger-Kernel/src/liger_kernel/ops/utils.py", line 40, in wrapper
+    return fn(ctx, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/Liger-Kernel/dev/moe_research/variants/v9_ws.py", line 1362, in forward
+    _fused_up_proj_swiglu_kernel[
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/triton/runtime/jit.py", line 370, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/triton/runtime/autotuner.py", line 240, in run
+    benchmark()
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/triton/runtime/autotuner.py", line 229, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/triton/runtime/autotuner.py", line 164, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/triton/testing.py", line 149, in do_bench
+    fn()
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/triton/runtime/autotuner.py", line 150, in kernel_call
+    self.fn.run(
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/triton/runtime/jit.py", line 739, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/triton/runtime/jit.py", line 884, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/triton/compiler/compiler.py", line 327, in compile
+    next_module = compile_ir(module, metadata)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/triton/backends/nvidia/compiler.py", line 549, in <lambda>
+    stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options, capability)
+                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/Liger-Kernel/.venv/lib/python3.12/site-packages/triton/backends/nvidia/compiler.py", line 321, in make_ttgir
+    pm.run(mod, 'make_ttgir')
+RuntimeError: PassManager::run failed

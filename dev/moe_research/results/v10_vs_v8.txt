@@ -1,0 +1,16 @@
+[check] variants/v8_best.py
+  correctness: PASS
+[check] variants/v10_fuseagg.py
+  correctness: PASS
+
+config: E=128 H=2048 I=768 K=8 dtype=bf16 skew=0.0
+      T      mode                     v8_best.py                 v10_fuseagg.py
+   1024   forward              0.512 ms ( 1.00x)              0.570 ms ( 0.90x)
+   1024      full              1.662 ms ( 1.00x)              1.719 ms ( 0.97x)
+   8192   forward              1.600 ms ( 1.00x)              1.989 ms ( 0.80x)
+   8192      full              5.250 ms ( 1.00x)              5.791 ms ( 0.91x)
+  32768   forward              5.263 ms ( 1.00x)              7.248 ms ( 0.73x)
+  32768      full             20.933 ms ( 1.00x)             20.841 ms ( 1.00x)
+[mem full] T=1024: v8_best.py: 1228 MB | v10_fuseagg.py: 0 MB
+[mem full] T=8192: v8_best.py: 1761 MB | v10_fuseagg.py: 1761 MB
+[mem full] T=32768: v8_best.py: 3589 MB | v10_fuseagg.py: 3589 MB
