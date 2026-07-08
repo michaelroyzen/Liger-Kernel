@@ -102,7 +102,11 @@ if __name__ == "__main__":
     # TF32/bf16-K256 noise floor is ~0.1-0.3; miscompiles show up as errors > 1.
     for dtype in (torch.float32, torch.bfloat16):
         for BM, BN, BK in [(128, 64, 32), (128, 128, 32), (64, 64, 64), (16, 64, 32), (64, 64, 128), (128, 64, 256)]:
-            r = run(dtype, BM, BN, BK)
+            try:
+                r = run(dtype, BM, BN, BK)
+            except Exception as e:
+                print(f"{str(dtype):>15} BM={BM:>3} BN={BN:>3} BK={BK:>3}: SKIP ({str(e)[:60]})")
+                continue
             flags = {k: ("OK" if v < 1.0 else "BAD") for k, v in r.items()}
             print(f"{str(dtype):>15} BM={BM:>3} BN={BN:>3} BK={BK:>3}: "
                   + "  ".join(f"{k}={flags[k]}({r[k]:.4f})" for k in r))

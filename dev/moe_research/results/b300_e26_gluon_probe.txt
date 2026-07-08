@@ -1,0 +1,33 @@
+NVIDIA B300 SXM6 AC cap=(10, 3), triton 3.7.1
+   ptr (triton, BN=256 ns=3): OK    0.179 ms     1150 TFLOPS
+           gluon0 (sync mma): OK    0.375 ms      550 TFLOPS
+gluonP BM128 BN256 BK64 ns2 nw8: OK    0.311 ms      664 TFLOPS
+gluonP BM128 BN256 BK64 ns3 nw8: OK    0.206 ms     1001 TFLOPS
+gluonP BM128 BN256 BK64 ns4 nw8: OK    0.205 ms     1005 TFLOPS
+gluonP BM128 BN128 BK64 ns4 nw8: OK    0.299 ms      689 TFLOPS
+gluonP BM128 BN256 BK128 ns2 nw8: OK    0.257 ms      801 TFLOPS
+gluonP BM128 BN256 BK64 ns3 nw4: OK    0.202 ms     1018 TFLOPS
+gluonP BM64 BN256 BK64 ns4 nw4: OK    0.274 ms      753 TFLOPS
+gluonA BM128 BN256 BK64 ns3 nw8: OK    0.212 ms      974 TFLOPS
+gluonA BM128 BN256 BK64 ns4 nw8: OK    0.202 ms     1020 TFLOPS
+gluonA BM128 BN256 BK128 ns3 nw8: ERR out of resource: shared memory, Required: 294968, Hardware limit: 232448. Reducing block sizes or `num_stages`
+gluonA BM128 BN256 BK64 ns4 nw4: OK    0.204 ms     1010 TFLOPS
+gluonB BM128 BN256 BK64 ns3 nw8: OK    0.215 ms      958 TFLOPS
+gluonB BM128 BN256 BK64 ns4 nw8: OK    0.217 ms      951 TFLOPS
+gluonB BM128 BN256 BK64 ns4 nw4: OK    0.217 ms      952 TFLOPS
+gluonB BM128 BN128 BK64 ns4 nw8: OK    0.289 ms      712 TFLOPS
+gluonC BM128 BN256 BK64 ns2 nw8: OK    0.309 ms      667 TFLOPS
+gluonC BM128 BN256 BK32 ns4 nw8: ERR Expected block_shape[-1] to be at least 64 but got 32
+gluonC BM128 BN256 BK32 ns5 nw8: ERR Expected block_shape[-1] to be at least 64 but got 32
+gluonC BM128 BN256 BK64 ns2 nw4: OK    0.303 ms      679 TFLOPS
+gluonC BM128 BN128 BK64 ns3 nw8: OK    0.239 ms      863 TFLOPS
+gluonWS BM128 BN256 BK64 ns3 nw4: OK    0.361 ms      572 TFLOPS
+gluonWS BM128 BN256 BK64 ns4 nw4: OK    0.357 ms      578 TFLOPS
+gluonWS BM128 BN256 BK64 ns4 nw8: OK    0.355 ms      581 TFLOPS
+gluonWS BM128 BN128 BK64 ns4 nw4: OK    0.555 ms      371 TFLOPS
+gluonWS BM128 BN256 BK128 ns2 nw4: OK    0.314 ms      657 TFLOPS
+gluonT BM128 BN256 BK64 ns4 nw8: OK    0.251 ms      821 TFLOPS
+gluonT BM128 BN256 BK64 ns4 nw4: OK    0.245 ms      842 TFLOPS
+gluonT BM128 BN256 BK64 ns8 nw4: ERR out of resource: shared memory, Required: 393344, Hardware limit: 232448. Reducing block sizes or `num_stages` may help.
+gluonT BM128 BN256 BK128 ns2 nw4: OK    0.234 ms      881 TFLOPS
+gluonT BM128 BN256 BK64 ns2 nw4: OK    0.197 ms     1044 TFLOPS

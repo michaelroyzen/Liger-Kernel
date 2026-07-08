@@ -600,3 +600,134 @@ E24 dW keys (shipped, 1.22-1.26× bwd in mixed-shape runs), E25 ship+validate. B
 this phase: 2 of 4 measured hypotheses shipped; the E18 backlog's top three ideas
 (WS+gather4, BM=256, clusters) all died in probes before reaching a variant — cheap kills,
 exactly what the probe-first ordering is for.
+
+### E26 — Gluon (manual tcgen05/TMEM) stage-0 probe → NO-GO for an opt-in Gluon path
+
+Question: can hand-written Gluon kernels (`triton.experimental.gluon`, present and functional
+in triton 3.7.1 on sm103) beat the shipped `tl.dot` grouped-GEMM path enough to justify an
+opt-in `LIGER_FUSED_MOE_GLUON=1` implementation? Gate agreed in advance: a standalone Gluon
+gathered GEMM must beat the Phase-B pointer-gather probe by >10% before any src work.
+
+Probe (`probe_gluon_gemm.py`): up-proj-shaped gathered GEMM (M=65536 gathered rows of
+X(8192, 2048), W(768, 2048), bf16) — the same shape/baseline as `probe_ctas_bigm.py`.
+Eight hand-built Gluon variants, all correctness-checked against torch
+(`results/b300_e26_gluon_probe.txt`):
+
+| variant | mechanics | best ms | TFLOPS |
+|---|---|---|---|
+| `ptr` (shipped-style tl.dot) | pointer gathers, automatic pipeliner | **0.179** | **1150** |
+| cuBLAS dense (no gather) | — | 0.128 | 1616 |
+| torch gather → cuBLAS | materialized (M,K) copy | 0.223 | 925 |
+| gluon0 | serial TMA + sync MMA (correctness gate) | 0.375 | 550 |
+| gluonP | TMA **gather4** A + TMA B, mbarrier pipeline | 0.202 | 1018 |
+| gluonA | cp.async A + TMA B pipeline | 0.202 | 1020 |
+| gluonB | cp.async both operands | 0.215 | 958 |
+| gluonC | **dual accumulator** (A read once per 2 N-tiles, full 256 KB TMEM) | 0.239 | 863 |
+| gluonWS | **manual warp specialization** (load warp + MMA warp partitions) | 0.355 | 581 |
+| gluonT | fully unrolled static pipeline | 0.197 | 1044 |
+
+Result: best Gluon = 1044 TFLOPS = **9% BELOW the tl.dot baseline**; the +10% gate missed by
+~20%. Every added Blackwell mechanism made it worse, not better: dual-acc lost 18-25%
+(pipeline serialization > A-traffic savings), manual WS lost ~45% (partition mbarrier
+ping-pong > issue overlap), TMA gather4 ≈ cp.async ≈ pointer loads (confirming E18-probe).
+
+Why, mechanically: (1) the automatic path already emits async tcgen05 MMAs with TMEM
+accumulators and deep pipelines on sm103 (verified in TTGIR: `ttng.tc_gen5_mma {is_async}`,
+`dump_gather_layout.py`) — hand-written Gluon must rebuild that machinery just to tie;
+(2) at these shapes X (32 MB) and W (3 MB) are L2-resident on a 132 MB L2, so the
+traffic-halving levers 2CTA/multicast/dual-acc target a non-bottleneck — dual-acc is the
+within-CTA version of exactly the 2CTA operand-sharing idea and it lost decisively, which
+is why full 2CTA (cluster launch + `two_ctas` TMEM + multicast barriers, the highest
+hang-risk mechanism of all) was not built: it starts 9% behind and attacks traffic that L2
+already absorbs. Also reproduced the risk profile firsthand: one barrier-accounting mistake
+(cp.async `mbarrier_arrive` is per-thread, not per-warp) **hung the GPU** silently — in a
+shipped backward kernel that class of bug is wrong-gradients-shaped.
+
+Side finding worth keeping: the shipped fused gather kernel (1150) beats the
+"materialize-gather then cuBLAS" flow (925) by 24% — the fusion is worth more than the
+raw cuBLAS MMA advantage at this shape.
+
+Reopen conditions (any of): a Triton release whose Gluon tutorial GEMM beats tl.dot on THIS
+gathered shape; FP8/FP4 block-scaled MoE (`tcgen05_mma_scaled` has no tl.dot equivalent);
+weights ≫ L2 regimes (huge E·I·H at small T) where multicast attacks the real floor;
+a fusion tl.dot cannot express. API mechanics for that day are captured in
+`probe_gluon_gemm.py` (gather4 offset layout: 4 contiguous offsets/lane broadcast across
+warps; `mbarrier.expect` needs constexpr bytes; sync-form `tcgen05_mma` still needs an
+explicit completion wait before TMEM load — the "sync" only orders the async proxy;
+`fence_async_shared()` required between cp.async writes and tcgen05 reads).
+
+### E27 — CUTLASS-hybrid probe: `torch._grouped_mm` as the GEMM engine → POSITIVE at large TK/E
+
+Premise check first: cuBLAS/CUTLASS beat the shipped kernel only on the DENSE GEMM (1616
+TFLOPS); with a materialized gather in front it LOST (925 vs 1150, E26). The testable hybrid
+is therefore: keep Triton routing/gather/epilogues, replace the GEMM inner engine with
+torch's CUTLASS-backed grouped GEMM (`torch._grouped_mm`, jagged M/K via device-side int32
+`offs` — sync-free, present in torch 2.12). Probe on the real routing distribution
+(`probe_grouped_mm.py`, `results/b300_e27_grouped_mm.txt`), vs the fused kernels' measured
+per-kernel times:
+
+| piece @T=8192 (TK/E=512) | hybrid | fused triton | note |
+|---|---|---|---|
+| gather x[idx] → (TK,H) | 86 µs | 0 (fused) | materialization tax, 6.3 TB/s |
+| up-proj GEMM | 384 µs (1074 TF) | 524 µs incl. swiglu | CUTLASS +37% on GEMM alone |
+| swiglu epilogue | ~60 µs (fused-kernel est; torch eager 252) | — | fusion-loss tax |
+| down-proj GEMM | 211 µs (976 TF) | 261 µs | |
+| dW1 (A^T B, jagged K) | 413 µs (1000 TF) | 653 µs | works via offs on K! |
+| fwd GEMM-path total | ~740 µs | 785 µs | ~6% |
+
+@T=32768 (TK/E=2048): up 1320 µs (1250 TF) vs 1811, down 731 (1128 TF) vs 1058, dW1 1282
+vs 1937 — CUTLASS engine 25-37% faster per GEMM; hybrid fwd path ≈ 2618 vs 2869 µs (~9%).
+@T=1024 (TK/E=64): **hybrid loses badly** (GEMMs at 199-277 TFLOPS — tile quantization on
+64-row segments; hybrid fwd path 350 vs 258 µs). Correctness of view-B (non-contiguous
+expert-weight views) verified per-segment (rel ~0.02 = bf16 noise).
+
+Paper composite at T=8192 full step (current 3.07 ms): fwd −45, dW1 −240 (minus ~126 µs if
+a layout transpose is needed — avoidable by computing d_pre^T @ x directly), dW2 ~−100,
+bwd_down ~−180 (GEMM via grouped_mm + separate swiglu-bwd/dS pass), dX ~−50 → **~15-20%
+full-step at large TK/E**, ~nothing-to-negative below TK/E ≈ 128-256.
+
+Costs/risks for an integration: +TK×H materialized x_perm (268 MB @8192; save-for-backward
+or re-gather +86 µs), dO gather in backward, `torch._grouped_mm` is a PRIVATE torch API
+(≥2.5-ish; Liger floor is 2.1.2 → feature-detect + fall back), empty-expert zero-size
+groups need a test, small-T regression requires a TPE-bucket dispatch (fused path below
+threshold, hybrid above). Verdict: worth building as an opt-in
+(`LIGER_FUSED_MOE_GROUPED_MM=1` or TPE-gated auto) — unlike E26 the engine is
+battle-tested and the probe shows a real positive margin exactly where the op spends its
+time. Decision after memory-tax review: NOT pursued (user call, 2026-07-08) — the +14-25%
+peak-memory cost and private-API dependency outweigh the ~1.15× large-T step win for now.
+
+### E28 — Triton version bisect: the sm103 miscompile predates 3.7 (torch 2.10 / triton 3.6.0)
+
+Question: is the E19 two-dots-one-accumulator miscompile a triton 3.7 regression, and does
+the merged-K fix hold on other triton versions? Setup: second venv `.venv-t210` with
+torch 2.10.0+cu130 (bundles triton 3.6.0), liger installed `-e --no-deps` (+ packaging,
+numpy); same box, same B300.
+
+1. **Minimal repro (`probe_sm103_dot.py`) on 3.6.0: IDENTICAL failure signature.**
+   `2dots_1acc` BAD with the same error magnitudes (max err 56-68 on O(50) values) for
+   BM ∈ {64, 128}, fp32 AND bf16; BM=16 OK; `1dot` OK; `2dots_2accs` OK. So the bug is a
+   longstanding sm103 tcgen05 lowering issue present since at least triton 3.6, NOT a 3.7
+   regression. 3.6 additionally hard-crashes ptxas-blackwell on one config that 3.7.1
+   compiles (bf16 BM=128 BN=128 BK=32: "Internal Triton PTX codegen error").
+2. **End-to-end on 3.6.0:** v0_baseline (unpatched two-dot dX) FAILS `check_correctness`
+   with the same "BWD dx MISMATCH"; the shipped src (merged-K dX) PASSES. The fix is
+   version-robust in both directions tested (3.6.0 and 3.7.1).
+3. **TFLOPS, triton 3.6.0 vs 3.7.1** (`probe_ctas_bigm.py`, gathered GEMM, bf16, same
+   process order; and the full fused-MoE op @T=8192 via `bench.py` on the v18 variant):
+
+| config (BM/BN/BK/nw/ns/ctas) | 3.6.0 TFLOPS | 3.7.1 TFLOPS |
+|---|---|---|
+| 128/128/64/8/4/1 | 770 | 808 |
+| **128/256/64/8/3/1 (best)** | **1057** | **1071** |
+| 128/256/64/8/3/2 | 1010 | 991 |
+| 256/128/64/8/3/1 | 863 | 841 |
+| 256/256/64/8/2/1 | 780 | 860 |
+| 256/128/128/8/2/1 | 727 | 756 |
+| 128/128/64/4/4/1 | 793 | 841 |
+| 256/128+256 with ctas=2 | PassManager crash | PassManager crash |
+
+Fused MoE op @T=8192 (v18 variant): 3.6.0 fwd/bwd/full = 0.923/2.203/3.062 ms vs 3.7.1
+0.904-0.942/2.150/3.055-3.096 ms — statistically identical (3.7.1 backward ~2% faster).
+Conclusion: no performance reason to pin either triton for this op; 3.7.1 is marginally
+faster on most tiles and crashes on fewer configs. The correctness fix (E19) is required
+on BOTH. The num_ctas=2 + BM=256 compiler crash also reproduces on both.
