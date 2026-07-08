@@ -44,6 +44,8 @@ interior-tile mask specialization (E14, 0.95×).
 **Portability**: only TMA is hardware-gated (cap ≥ 9 + alignment, with a portable fallback —
 A100 degrades gracefully, B200 auto-enables); everything else is architecture-agnostic.
 Full audit + Blackwell warp-spec follow-up design (TMA gather4 + sm100 gate): see E17.
+Ranked Blackwell research backlog (WS+gather4, un-capped tiles via TMEM, cluster multicast,
+L2 retune, fusion revisit): see E18.
 
 Improving [PR #1179](https://github.com/linkedin/Liger-Kernel/pull/1179) (fused MoE Triton kernels,
 already merged on this fork's `main`) with ideas from [SonicMoE](https://github.com/Dao-AILab/sonic-moe)
@@ -327,3 +329,42 @@ invalid rows feeding the dS reduction. Expected order 10–25% on the GEMMs (Tri
 tutorial ballpark) — a hypothesis to measure on a B200, not a claim; Hopper keeps the current
 path (its WS remains blocked unless tokens are pre-gathered, which re-adds the TK×H round
 trip this project eliminated).
+
+### E18 — Blackwell (sm100) research directions — ranked backlog, NOT YET RUN
+
+Everything on H100 is measured; everything below is a ranked hypothesis for a future B200/B300
+box, ordered by expected payoff × confidence. Relevant sm100 hardware deltas vs sm90: tcgen05
+MMA with accumulators in a dedicated 256 KB/SM tensor memory (TMEM) instead of registers,
+2-CTA MMA (CTA pairs share operands), TMA gather4/scatter4 (row-indexed tensor loads/stores),
+~2.5× larger (dual-die, partitioned) L2, HBM3e ≈ 8 TB/s, same 228 KB smem/SM.
+Gating hook: `infer_device_arch()` + autotune config spaces; the `dev/moe_research/` harness
+runs unchanged on a new GPU.
+
+1. **Warp specialization + TMA gather4** (the E17 design, sm100-gated). Expected 10–25% on the
+   six GEMMs. Split into two experiments: (a) descriptor-gather for token rows *without* WS —
+   removes per-row address math and LSU pressure from the hot loop on its own; (b) gather + WS.
+2. **Un-cap the tile-size vector (extends E5/E12).** On Hopper, BLOCK_M is register/occupancy-
+   capped (fp32 accumulators live in the register file); on sm100, TMEM holds accumulators and
+   2-CTA MMA shares the weight operand across an SM pair. Raise `_pick_block_m_token`'s cap
+   (128 → 256) and widen BN/BK/stages under an sm100 gate. Same physics as E5: weight re-reads
+   per expert = ceil(tokens/BLOCK_M), so each doubling halves the dominant large-T traffic term.
+   Config-space work only — the metadata layer already parameterizes BLOCK_M.
+3. **Cluster multicast for expert weights.** TMA multicast within a thread-block cluster loads
+   one weight tile into several SMs' smem per HBM transaction — the only lever that attacks the
+   small-T weight-read floor itself (0.36 ms on H100; nothing shipped could lower it, only
+   approach it). Most speculative: Triton cluster support is the least mature piece involved.
+4. **GROUP_M / swizzle retune for the larger L2 (extends E4).** GROUP_M=8/4 were tuned against
+   50 MB L2; B200 has ~2.5× that but split across two dies — bigger groups fit, yet an expert's
+   working set straddling dies could regress. Cheap sweep, modest expected gain.
+5. **Fused up+SwiGLU+down forward becomes more attractive.** TMEM-freed smem lets the 96 KB y1
+   slice (BLOCK_M=64, I=768) coexist with deeper pipelines, softening the fusion's main cost.
+   The BLOCK_M=64-vs-128 tension (see E5) still needs to be settled empirically per shape.
+6. **Free riders (no work needed):** bandwidth-bound pieces (token gather, memset savings) scale
+   ~2.4× with HBM3e automatically; sync-free scheduling / CUDA-graph capture / fp32 dS /
+   inference path are architecture-neutral; shipped TMA weight loads auto-enable via cap ≥ 9.
+7. **(Tradeoff option, flagged not endorsed):** Blackwell-native MXFP8 block-scaled storage of
+   the saved pre_act — the only lever that touches the ~9.7 GB @T=8192 (48 layers) of saved
+   activations, but a numerics tradeoff by construction, unlike items 1–5.
+
+Caution from this project's own base rate: 5 of 12 paper-plausible hypotheses lost on silicon
+(E9/E10/E13/E14 + part of E7). Treat this list as an experiment queue, not a promise.
