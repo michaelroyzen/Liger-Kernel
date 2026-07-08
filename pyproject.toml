@@ -58,6 +58,9 @@ line-length = 120
 target-version = "py310"
 respect-gitignore = true
 src = ["src"]
+extend-exclude = [
+    "dev/moe_research",  # kernel autoresearch scratch area (variant files mirror upstream style)
+]
 
 [tool.ruff.lint]
 select = [
