@@ -560,14 +560,35 @@ Validation:
 - `benchmark/data/all_benchmark_data.csv` refreshed with B300 rows for both sweep dims
   (T and num_experts); H100 rows retained (gpu_name column distinguishes).
 
-**Known-issue note (pre-existing, NOT this kernel):** bf16 convergence
+**Known-issue note (pre-existing on B300, characterized):** bf16 convergence
 `test_mini_model[mini_qwen3_moe]` fails on this B300 box with 2 of 32 loss steps outside
-rtol=0.2 (late steps 29-32) — identically on the pristine aeab3e3 checkout. The convergence
-suite never exercises fused_moe (no `fused_moe` reference in `monkey_patch.py`; the MoE
-block runs stock HF + LigerQwen3MoeSwiGLUMLP), the same test passes in fp32 and the dense
-mini_qwen3 passes in bf16, so this is late-step bf16 training chaos under tcgen05
-accumulation order vs the H100-calibrated tolerances — upstream tolerance work, out of
-scope here.
+rtol=0.2 (late steps 29-32) — identically on the pristine aeab3e3 checkout. CORRECTION
+(found during E30): with transformers ≥ 5 the qwen3_moe patch wires
+`Qwen3MoeExperts = LigerExperts` → `LigerFusedMoEFunction`, so this test DOES exercise the
+fused MoE kernels (an earlier note here claimed otherwise after grepping monkey_patch.py
+for "fused_moe" — the wiring goes through the LigerExperts import). The failures are
+PR-neutral (see E30 pristine controls); on the fixed kernel: fp32 passes, dense mini_qwen3
+bf16 passes, per-config dX sweeps and full-op bf16 fidelity at the mini shapes are clean
+(rel ≤ 0.06), and the loss curves track the reference for most steps before single-step
+excursions — late-step bf16 training chaos vs H100-calibrated per-step tolerances.
+Upstream tolerance work.
+
+### E30 — Convergence matrix on the final PR code (each on its own clean GPU)
+
+| test | result | control |
+|---|---|---|
+| fp32 `mini_qwen3_moe` | **PASS** (5:38) | — |
+| bf16 `mini_qwen3_moe` | FAIL: 2/32 loss steps outside rtol=0.2 (steps 29, 31) | identical failure on pristine aeab3e3 (E25); mismatch values reproduce exactly across runs/days |
+| bf16 `mini_qwen3_5_moe` | FAIL: 1/32 loss steps (step 15: 7.9617 vs 6.1676) | **pristine control fails at the SAME index with BIT-IDENTICAL values** → the PR changes this test's outcome by exactly nothing |
+| fp32 `mini_qwen3_5_moe` | SKIPPED (upstream `pytest.mark.skip`: "flash-linear-attention's ChunkGatedDeltaRuleFunction does not support float32; Torch's implementation takes too long") | — |
+
+The bit-identical pristine-vs-patched qwen3_5_moe failure is the strongest possible evidence
+that the bf16 convergence failures are a pre-existing B300 tolerance issue, not this PR:
+at the mini shapes the trajectories are deterministic and unchanged by the fix + config
+extras. (Qwen3.5's GatedDeltaNet recurrence amplifies bf16 divergence faster than plain
+attention — 1 excursion by step 15 vs step 29 for qwen3_moe.) Benchmarks: CSV already
+carries the 168 B300 fused_moe rows (E25); headline vs the HF eager loop on B300:
+full step @T=8192 151.3 → 4.75 ms (**32×**), forward 30.5 → 0.93 ms (**33×**).
 
 **Environment gotcha (documented for the next box):** this AMI exports
 `LD_LIBRARY_PATH=/usr/local/cuda/...` (system CUDA 13.2), which mid-session started
@@ -731,3 +752,109 @@ Fused MoE op @T=8192 (v18 variant): 3.6.0 fwd/bwd/full = 0.923/2.203/3.062 ms vs
 Conclusion: no performance reason to pin either triton for this op; 3.7.1 is marginally
 faster on most tiles and crashes on fewer configs. The correctness fix (E19) is required
 on BOTH. The num_ctas=2 + BM=256 compiler crash also reproduces on both.
+
+**End-to-end suite on triton 3.6.0** (torch 2.10 venv, clean GPU): `pytest
+test/transformers/test_fused_moe.py` → **22 passed** (11:50). The patched src is fully
+green on both supported toolchains.
+
+### E29 — Determinism audit + real-workload repro (Qwen3.5-35B-A3B dims, pinned upstream rev)
+
+Context: fla-org/flash-linear-attention#945 reports a DIFFERENT sm103 Triton bug (GatedDeltaNet
+chunk kernel produces bitwise-nondeterministic output at num_warps=4/stages 2-3 — a
+scheduling race in the triton#9871 family, still broken in 3.6.0 AND 3.7.0). Two questions:
+is our E19 bug the same class, and does a real Qwen3.5-MoE training stack hit E19 unpatched?
+
+1. **Determinism audit of the shipped op** (`probe_determinism.py`, #945's bit-hash method,
+   25 identical fwd+bwd calls): out/dx/dW1/dW2 **bitwise deterministic** at T ∈
+   {1024, 8192, 32768}; only dS varies across runs (fp32 atomic_add partial-sum order — by
+   design, documented). Matches #945's own point-4 finding that Liger fused-MoE kernels are
+   deterministic. **E19 is therefore NOT the #945 race**: it is a deterministic tcgen05
+   miscompile (same wrong bits every run) in a different code pattern (two dots chained into
+   one accumulator vs their single-dot sequential chunk loop). Same family (sm103 Triton
+   codegen, survives 3.6→3.7), different bug.
+2. **Real-workload repro** (`probe_monorepo_repro.py`): the monorepo training stack
+   (`run_train_grpo_multi.sh` → TRL `use_liger_kernel` → `apply_liger_kernel_to_qwen3_5_moe`
+   with default `swiglu=True` → `Qwen3_5MoeExperts = LigerExperts` →
+   `LigerFusedMoEFunction`) pins upstream liger @ 96ce8e8, whose dX kernel still has the
+   two-dot pattern. At Qwen3.5-35B-A3B MoE dims (H=2048, **E=256, I_moe=512**, K=8, T=8192,
+   TK/E=256 → BLOCK_M=128 tcgen05 regime), on B300:
+   - pinned upstream rev: **dx max-rel ≈ 5.2 (fp32) / 5.3 (bf16) — CORRUPTED** (dW1/dW2/dS
+     clean at 0.01-0.12); autotune picked BN=64/BK=32/ns=2 and BN=128/BK=32/ns=3, both in
+     the broken set. Deterministically wrong → invisible to run-to-run fingerprinting.
+   - patched fork: dx 0.023 / 0.082 — clean, same shapes/seeds/GPU class.
+   Conclusion: any Qwen3.5/Qwen3-MoE-style training with upstream Liger's fused MoE on
+   sm100/sm103 backpropagates corrupted dx through every MoE block (all upstream layers'
+   gradients poisoned; the MoE weights' own grads remain correct). The E19 fix must reach
+   upstream; until then, pin liger to this fork's branch.
+
+### E30 — Profile: Liger chunked GRPO loss runs its backward on fp32 SIMT GEMMs (24× off floor)
+
+`probe_grpo_loss.py`, B300, Qwen3.5-35B-A3B lm_head shapes (H=2048, V=248320, bf16 weights),
+their trainer config (beta=0, temperature=1, old_logps provided, TORCH_DYNAMO_DISABLE=1):
+
+| B×T (tokens) | chunk | fwd+bwd | effective | GEMM-floor (cuBLAS 1648 TF) | peak mem |
+|---|---|---|---|---|---|
+| 4×4096 (16K) | 1 | 744 ms | 67 TFLOPS | 30 ms | +2.9 GB |
+| 4×16384 (65K) | 1 | 2971 ms | 67 TFLOPS | 121 ms | +3.0 GB |
+| 4×16384 (65K) | 4 | 3001 ms | 67 | — | +3.4 GB |
+| 4×16384, compiled=True | 1 | 2975 ms | 67 | — | +3.0 GB |
+
+Per-kernel: **77.8% of time is two `cutlass3x_sm100_simt_sgemm_f32...` kernels** — the
+`_selective_logprob_backward` matmuls (`grad_logits @ weight_chunk.float()`,
+`grad_logits.T @ hidden_chunk.float()`) run fp32 × fp32, which cuBLAS dispatches to SIMT
+(CUDA-core) GEMMs because `allow_tf32=False` (torch default). Measured on the exact chunk
+shape: fp32 SIMT 57 TFLOPS vs TF32 659 vs bf16 1232. Another 4.9% is fp32 `.float()` weight-
+chunk copies. The forward GEMM is already bf16 tensor-core (`nvjet_sm103`, 3.1%). chunk_size
+and torch.compile are irrelevant (the GEMMs dominate; their run disables dynamo anyway).
+
+NOT arch-specific: fp32 SIMT is ~20× off bf16 floor on H100 too — this is an upstream Liger
+issue on every GPU. Fix: run the backward matmuls with bf16 operands (fp32 accumulation
+across chunks is preserved by the existing fp32 grad buffers; per-chunk bf16 GEMMs
+internally accumulate fp32 — strictly better numerics than stock TRL, whose whole backward
+is bf16), which also deletes the fp32 weight copies. Expected ~5-9× on the loss
+(2971 → ~300-550 ms at 65K tokens); TF32 (~660 TF) is the more conservative variant.
+Caveat for the monorepo: `train_step_grpo.py` never sets TRL's `use_liger_loss`, so their
+GRPO run likely uses TRL's own logps path today — this finding is both a fix for Liger
+upstream and a reason the flag isn't currently worth enabling as-is.
+
+### E31 — Fix shipped: bf16 tensor-core backward for the chunked selective-logprob loss
+
+Change (`src/liger_kernel/chunked_loss/fused_linear_ppo.py`): the two backward GEMMs in
+`_selective_logprob_backward` now run with operands in `hidden.dtype` (fp32 casts removed);
+the fp32 accumulation buffers and all softmax/dS math stay fp32, so per-chunk products are
+fp32-accumulated inside cuBLAS and fp32-summed across chunks — strictly better numerics
+than a stock bf16 autograd backward, and a no-op for fp32 inputs. Also bumped the default
+chunk sizes 2048×4096 → 4096×8192 (measured 21% at identical +3.0 GB peak; larger chunks
+trade memory for little: 8192×16384 was only +5% more for +1.8 GB).
+
+Validation: parity probe vs fp32-gold reference — fixed path max-err 0.00359/0.00381
+(grad_weight/grad_hidden) vs TRL-style bf16 autograd's 0.00373/0.00383, i.e. numerically
+*better* than what training uses today; full `test/chunked_loss/test_grpo_loss.py`:
+**976 passed, 614 skipped** (5:29); checkstyle green. (Two earlier suite runs on GPU 5
+stalled without a pytest summary after an unclean kill of the first; the suspect test
+passes standalone in 12 s and the clean GPU 6 run passed everything — stalls attributed to
+the polluted GPU-5 context, not the change.)
+
+Result (`probe_grpo_loss.py`, B300, H=2048, V=248320, their trainer config):
+
+| tokens | before | after | speedup | peak mem |
+|---|---|---|---|---|
+| 16K | 744 ms (67 TF) | 149 ms | **5.0×** | +2.9 GB (unchanged) |
+| 65K | 2971 ms (67 TF) | 581 ms (~340 TF) | **5.1×** | +3.0 GB (unchanged) |
+
+Head-to-head vs the TRL-built-in-style logps path (`probe_grpo_head2head.py`, same loss
+family: dapo, sequence-level IS, beta=0):
+
+| tokens | TRL-style (logits in graph) | Liger fixed | memory ratio |
+|---|---|---|---|
+| 16K | 40.7 ms, **+22.2 GB** | 149.3 ms, **+2.9 GB** | 7.6× less |
+| 65K | 173.8 ms, **+91.9 GB** | 581.4 ms, **+3.0 GB** | 30× less |
+
+Verdict: post-fix the Liger loss is 5× faster than before but still ~3.3× slower than
+TRL's materialize-everything path in isolated wall-time — the remaining gap is the
+recompute design's second logits pass plus elementwise traffic, not GEMM dispatch (the
+nvjet tensor-core kernels are now the top profile entries). The trade is now honest:
+~0.4 s/rank/step at 65K tokens buys back ~89 GB of loss-stage memory — in a ZeRO-3 run
+that's the difference between batch 4 and batch ~8-12 (or 16K vs much longer completions),
+which more than repays 0.4 s. Enabling `use_liger_loss=True` is now a sane option for the
+monorepo; before the fix it would have cost ~3 s/rank/step.
