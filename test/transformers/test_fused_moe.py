@@ -7,6 +7,9 @@ Tests cover:
 3. Backward / gradient correctness
 4. Edge cases (empty experts, single expert, all tokens to one expert)
 5. Multiple dtypes
+6. Token-chunked backward (LIGER_FUSED_MOE_CHUNK_TILES): correctness vs the
+   unchunked path and the reference, chunk-boundary cases, bitwise determinism,
+   and the backward-memory cap that is the point of the mode
 """
 
 import pytest
@@ -295,3 +298,182 @@ def test_memory_efficient_mode():
     )
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     assert "MEM_EFFICIENT_OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Test 4: Token-chunked backward (LIGER_FUSED_MOE_CHUNK_TILES)
+#
+# The env var is read at forward-call time and captured in ctx, so chunking
+# can be toggled per test via monkeypatch (no subprocess needed).
+# ---------------------------------------------------------------------------
+
+
+def _run_fwd_bwd(x, gate_up_proj, down_proj, top_k_index, top_k_weights, retain_graph=False):
+    """One forward+backward; returns (out, dx, dW1, dW2, dS) detached."""
+    x1 = x.detach().clone().requires_grad_(True)
+    gup1 = gate_up_proj.detach().clone().requires_grad_(True)
+    dn1 = down_proj.detach().clone().requires_grad_(True)
+    wts1 = top_k_weights.detach().clone().requires_grad_(True)
+    out = LigerFusedMoEFunction.apply(x1, gup1, dn1, top_k_index, wts1)
+    out.sum().backward(retain_graph=retain_graph)
+    return out.detach(), x1.grad, gup1.grad, dn1.grad, wts1.grad
+
+
+_GRAD_NAMES = ("out", "dx", "dgate_up_proj", "ddown_proj", "dtopk_weights")
+
+
+@pytest.mark.parametrize(
+    "T, E, H, intermediate_dim, K",
+    [
+        (512, 8, 256, 128, 2),  # T*K/E=128, BLOCK_M=128 → 1 tile/expert: windows split experts exactly
+        (512, 8, 97, 47, 2),  # odd H/I: tail masking inside the staging buffers
+        (512, 7, 128, 64, 3),  # prime E + K=3 (non-pow2 K in the dx-apply kernel)
+        (128, 8, 256, 64, 8),  # K=E: every token's assignments span many windows
+        (7, 4, 64, 32, 2),  # T < BLOCK_M: single ragged tile
+    ],
+)
+@pytest.mark.parametrize("chunk_tiles", [1, 3, 10_000])  # 1 tile, ragged tail, chunk > total tiles
+def test_chunked_backward_matches_unchunked(T, E, H, intermediate_dim, K, chunk_tiles, monkeypatch):
+    """Chunked backward must match the unchunked path (tolerance-based: the fp32
+    cross-chunk accumulators change the summation order, so bitwise equality
+    with the unchunked path is NOT expected) and the fp32 reference loop."""
+    dtype = torch.float32
+    x, gate_up_proj, down_proj, top_k_index, top_k_weights = _make_inputs(T, E, H, intermediate_dim, K, dtype, device)
+
+    monkeypatch.delenv("LIGER_FUSED_MOE_CHUNK_TILES", raising=False)
+    unchunked = _run_fwd_bwd(x, gate_up_proj, down_proj, top_k_index, top_k_weights)
+
+    monkeypatch.setenv("LIGER_FUSED_MOE_CHUNK_TILES", str(chunk_tiles))
+    chunked = _run_fwd_bwd(x, gate_up_proj, down_proj, top_k_index, top_k_weights)
+
+    for name, got, want in zip(_GRAD_NAMES, chunked, unchunked):
+        torch.testing.assert_close(got, want, atol=3e-3, rtol=1e-2, msg=lambda m, n=name: f"{n}: {m}")
+
+    # And against the reference implementation's autograd.
+    x1 = x.detach().clone().requires_grad_(True)
+    gup1 = gate_up_proj.detach().clone().requires_grad_(True)
+    dn1 = down_proj.detach().clone().requires_grad_(True)
+    wts1 = top_k_weights.detach().clone().requires_grad_(True)
+    out_ref = _reference_moe_forward(x1, gup1, dn1, top_k_index, wts1)
+    out_ref.sum().backward()
+    ref = (out_ref.detach(), x1.grad, gup1.grad, dn1.grad, wts1.grad)
+    for name, got, want in zip(_GRAD_NAMES, chunked, ref):
+        torch.testing.assert_close(got, want, atol=3e-3, rtol=1e-2, msg=lambda m, n=name: f"{n} vs ref: {m}")
+
+
+def test_chunked_backward_bf16(monkeypatch):
+    """bf16 chunked grads track the unchunked bf16 grads within bf16 tolerances."""
+    T, E, H, intermediate_dim, K = 512, 8, 256, 128, 4
+    x, gate_up_proj, down_proj, top_k_index, top_k_weights = _make_inputs(
+        T, E, H, intermediate_dim, K, torch.bfloat16, device
+    )
+
+    monkeypatch.delenv("LIGER_FUSED_MOE_CHUNK_TILES", raising=False)
+    unchunked = _run_fwd_bwd(x, gate_up_proj, down_proj, top_k_index, top_k_weights)
+    monkeypatch.setenv("LIGER_FUSED_MOE_CHUNK_TILES", "2")
+    chunked = _run_fwd_bwd(x, gate_up_proj, down_proj, top_k_index, top_k_weights)
+
+    for name, got, want in zip(_GRAD_NAMES, chunked, unchunked):
+        torch.testing.assert_close(got, want, atol=1e-1, rtol=1e-2, msg=lambda m, n=name: f"{n}: {m}")
+
+
+def test_chunked_backward_zero_token_experts(monkeypatch):
+    """All tokens on expert 0 → every other expert is empty in every window;
+    their dW rows must stay exactly zero and grads must match the reference."""
+    T, E, H, intermediate_dim, K = 32, 8, 64, 32, 2
+    dtype = torch.float32
+    torch.manual_seed(0)
+    x = torch.randn(T, H, dtype=dtype, device=device)
+    gate_up_proj = torch.randn(E, 2 * intermediate_dim, H, dtype=dtype, device=device) * 0.02
+    down_proj = torch.randn(E, H, intermediate_dim, dtype=dtype, device=device) * 0.02
+    top_k_index = torch.zeros(T, K, dtype=torch.int32, device=device)
+    top_k_weights = torch.ones(T, K, dtype=dtype, device=device) / K
+
+    monkeypatch.setenv("LIGER_FUSED_MOE_CHUNK_TILES", "1")
+    out, dx, dW1, dW2, dS = _run_fwd_bwd(x, gate_up_proj, down_proj, top_k_index, top_k_weights)
+
+    assert torch.all(dW1[1:] == 0), "empty experts must have exactly zero dW1"
+    assert torch.all(dW2[1:] == 0), "empty experts must have exactly zero dW2"
+
+    x1 = x.clone().requires_grad_(True)
+    gup1 = gate_up_proj.clone().requires_grad_(True)
+    dn1 = down_proj.clone().requires_grad_(True)
+    wts1 = top_k_weights.clone().requires_grad_(True)
+    out_ref = _reference_moe_forward(x1, gup1, dn1, top_k_index, wts1)
+    out_ref.sum().backward()
+    for name, got, want in zip(_GRAD_NAMES, (out, dx, dW1, dW2, dS), (out_ref, x1.grad, gup1.grad, dn1.grad, wts1.grad)):
+        torch.testing.assert_close(got, want, atol=3e-3, rtol=1e-2, msg=lambda m, n=name: f"{n}: {m}")
+
+
+@pytest.mark.parametrize("chunk_tiles", [1, 2])
+def test_chunked_backward_bitwise_determinism(chunk_tiles, monkeypatch):
+    """Chunked runs must be bitwise identical run-to-run: the chunk loop is
+    serial and every cross-chunk accumulation is single-writer fp32 (no float
+    atomics). dS is excluded — it keeps the pre-existing fp32 atomics of the
+    unchunked path."""
+    T, E, H, intermediate_dim, K = 512, 8, 128, 64, 4
+    x, gate_up_proj, down_proj, top_k_index, top_k_weights = _make_inputs(
+        T, E, H, intermediate_dim, K, torch.bfloat16, device
+    )
+    monkeypatch.setenv("LIGER_FUSED_MOE_CHUNK_TILES", str(chunk_tiles))
+    a = _run_fwd_bwd(x, gate_up_proj, down_proj, top_k_index, top_k_weights)
+    b = _run_fwd_bwd(x, gate_up_proj, down_proj, top_k_index, top_k_weights)
+    for name, run1, run2 in zip(_GRAD_NAMES[:4], a[:4], b[:4]):
+        assert torch.equal(run1, run2), f"{name} is not bitwise deterministic across runs"
+
+
+def test_chunked_retain_graph_second_backward(monkeypatch):
+    """Chunked mode never writes over saved tensors (pre_act is recomputed into
+    per-backward staging), so retain_graph re-backward must work and reproduce
+    the same gradients bitwise."""
+    T, E, H, intermediate_dim, K = 64, 4, 64, 32, 2
+    x, gate_up_proj, down_proj, top_k_index, top_k_weights = _make_inputs(
+        T, E, H, intermediate_dim, K, torch.float32, device
+    )
+    monkeypatch.setenv("LIGER_FUSED_MOE_CHUNK_TILES", "2")
+    x1 = x.clone().requires_grad_(True)
+    out = LigerFusedMoEFunction.apply(x1, gate_up_proj, down_proj, top_k_index, top_k_weights)
+    out.sum().backward(retain_graph=True)
+    g1 = x1.grad.clone()
+    x1.grad = None
+    out.sum().backward()
+    torch.testing.assert_close(x1.grad, g1)
+
+
+@pytest.mark.skipif(device != "cuda", reason="uses torch.cuda memory stats")
+def test_chunked_backward_memory_cap(monkeypatch):
+    """The point of the mode: backward transients drop from TK-proportional to
+    window-proportional. At TK=65536 the unchunked backward materializes
+    ~(TK×2I + TK×I + TK×H) of transients; chunked staging is a few MiB plus the
+    fixed fp32 accumulators."""
+    T, E, H, intermediate_dim, K = 8192, 16, 512, 256, 8
+    x, gate_up_proj, down_proj, top_k_index, top_k_weights = _make_inputs(
+        T, E, H, intermediate_dim, K, torch.bfloat16, device
+    )
+
+    def peak_backward_bytes():
+        x1 = x.detach().clone().requires_grad_(True)
+        gup1 = gate_up_proj.detach().clone().requires_grad_(True)
+        dn1 = down_proj.detach().clone().requires_grad_(True)
+        wts1 = top_k_weights.detach().clone().requires_grad_(True)
+        out = LigerFusedMoEFunction.apply(x1, gup1, dn1, top_k_index, wts1)
+        loss = out.sum()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        loss.backward()
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() - base
+
+    # Warm up both paths first so autotune/compile scratch doesn't pollute peaks.
+    monkeypatch.delenv("LIGER_FUSED_MOE_CHUNK_TILES", raising=False)
+    peak_backward_bytes()
+    unchunked_peak = peak_backward_bytes()
+    monkeypatch.setenv("LIGER_FUSED_MOE_CHUNK_TILES", "8")
+    peak_backward_bytes()
+    chunked_peak = peak_backward_bytes()
+
+    assert chunked_peak < 0.5 * unchunked_peak, (
+        f"chunked backward peak {chunked_peak / 2**20:.1f} MiB not < 50% of "
+        f"unchunked {unchunked_peak / 2**20:.1f} MiB"
+    )

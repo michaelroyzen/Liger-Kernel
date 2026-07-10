@@ -1229,3 +1229,568 @@ def _moe_bwd_dW1_kernel(
 
     dW1_ptrs = dW1_ptr + expert_idx * stride_dW1_E + n_idx[:, None] * stride_dW1_N + h_idx[None, :] * stride_dW1_H
     tl.store(dW1_ptrs, acc.to(dW1_ptr.dtype.element_ty), mask=n_mask[:, None] & h_mask[None, :])
+
+
+# ---------------------------------------------------------------------------
+# Chunked backward kernels (LIGER_FUSED_MOE_CHUNK_TILES > 0)
+#
+# The chunked backward bounds every TK-proportional transient at a fixed chunk
+# capacity: the python loop in fused_moe backward walks the expert-grouped
+# M-tiles in fixed ascending [tile_base, tile_base + chunk_tiles) windows,
+# recomputes pre_act for the window (forward never stores it in this mode),
+# and accumulates dW1 / dW2 / dx into fp32 cross-chunk buffers.
+#
+# Chunk-local addressing: the sorted rows covered by a tile window are the
+# contiguous span [tile_row_start[tile_base], row_hi) (tiles never overlap and
+# cover sorted space without gaps), so staging buffers are indexed by
+# row - row_lo. row_lo/row_hi only exist on device (no-CPU-sync design), hence
+# the tl.load-based bounds below instead of host-side pointer offsets.
+#
+# Determinism: chunks are processed serially in fixed ascending order and
+# every accumulation below is single-writer — the (expert, out-tile) program
+# for dW, the (token, h-tile) program for dx — so the read-modify-write on the
+# fp32 accumulators is race-free within a launch and has a fixed association
+# order across launches: results are bitwise reproducible run-to-run. The only
+# float atomic remains dS (pre-existing, same as the unchunked path).
+#
+# No autotune, fixed launch configs: these kernels add into live cross-chunk
+# state (fp32 accumulators, global dS atomics). Autotune's config trials
+# re-run kernels, and its reset_to_zero / restore_value hooks are scoped to a
+# single launch — on chunk N they would wipe or double-count chunks 0..N-1.
+# Same practice as chunked_grpo_loss.py. No TMA either: descriptor paths are
+# not wired for chunk-local staging offsets (acceptable v1 perf gap, see plan).
+#
+# sm_103 (B300) note: every K-loop below issues exactly ONE tl.dot per
+# accumulator per iteration (the recompute kernel uses two independent
+# accumulators for gate/up), so the triton-lang/triton#10821 miscompile
+# pattern never occurs.
+# ---------------------------------------------------------------------------
+
+# Grouped-GEMM-shaped chunked kernels (recompute, bwd down-proj, dX).
+_CHUNKED_BLOCK_N = 128
+_CHUNKED_BLOCK_K = 64
+_CHUNKED_GROUP_M = 8
+_CHUNKED_NUM_WARPS = 8
+_CHUNKED_NUM_STAGES = 2
+
+# dW accumulation kernels.
+_CHUNKED_DW_BLOCK_M = 64
+_CHUNKED_DW_BLOCK_N = 128
+_CHUNKED_DW_BLOCK_K = 32
+_CHUNKED_DW_GROUP_M = 4
+
+# Token-gather dx apply kernel.
+_CHUNKED_DX_ADD_BLOCK_H = 256
+_CHUNKED_DX_ADD_NUM_WARPS = 4
+
+
+@triton.jit
+def _chunk_row_bounds(tile_row_start_ptr, total_tiles, tile_base, chunk_tiles, TK_total):
+    """Sorted-row span [row_lo, row_hi) covered by tiles [tile_base, tile_base+chunk_tiles).
+
+    Callers must guarantee tile_base < total_tiles. Windows extending past the
+    actual tile count end at TK_total (== expert_start[E], the total row count)."""
+    row_lo = tl.load(tile_row_start_ptr + tile_base)
+    hi_tile = tile_base + chunk_tiles
+    row_hi = tl.load(tile_row_start_ptr + tl.minimum(hi_tile, total_tiles - 1))
+    row_hi = tl.where(hi_tile < total_tiles, row_hi, TK_total)
+    return row_lo, row_hi
+
+
+@triton.jit
+def _moe_chunked_pre_act_recompute_kernel(
+    x_ptr,  # (T, H)
+    gate_up_proj_ptr,  # (E, 2*I, H) — W1
+    x_gather_idx_ptr,  # (TK,) int32
+    expert_start_ptr,  # (E+1,) int32
+    tile_row_start_ptr,  # (num_m_tiles,) int32
+    tile_expert_ptr,  # (num_m_tiles,) int32
+    total_tiles_ptr,  # (1,) int32 — actual number of m-tiles (device scalar)
+    pre_act_ptr,  # (C, 2*I) staging — output, chunk-local rows
+    tile_base,  # first tile of this chunk
+    chunk_tiles,  # window size in tiles
+    H_dim: tl.constexpr,
+    I_dim: tl.constexpr,
+    stride_x_T,
+    stride_x_H: tl.constexpr,
+    stride_w_E,
+    stride_w_N,
+    stride_w_K: tl.constexpr,
+    stride_pre_C,
+    stride_pre_N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """Backward-side recompute of pre_act = [x@W1_gate^T, x@W1_up^T] for one tile
+    window, stored at chunk-local staging rows (row - row_lo). Same GEMM
+    structure as _fused_up_proj_swiglu_kernel's pointer-load path, minus the
+    SwiGLU epilogue and post_act store."""
+    pid = tl.program_id(0)
+    NUM_PID_N: tl.constexpr = (I_dim + BLOCK_N - 1) // BLOCK_N
+    num_pid_m = tl.minimum(tl.load(total_tiles_ptr) - tile_base, chunk_tiles)
+    if pid >= num_pid_m * NUM_PID_N:
+        return
+    pid_m, pid_n = _grouped_pid_swizzle(pid, num_pid_m, NUM_PID_N, GROUP_M)
+
+    row_lo = tl.load(tile_row_start_ptr + tile_base)
+    row_start = tl.load(tile_row_start_ptr + tile_base + pid_m)
+    # int64 prevents expert_idx * stride_w_E overflow at large E*I*H (see #1246).
+    expert_idx = tl.load(tile_expert_ptr + tile_base + pid_m).to(tl.int64)
+    n_start = pid_n * BLOCK_N
+    expert_end = tl.load(expert_start_ptr + expert_idx + 1)
+
+    m_offs = tl.arange(0, BLOCK_M)
+    n_offs = tl.arange(0, BLOCK_N)
+    k_offs = tl.arange(0, BLOCK_K)
+
+    # int64 prevents row_offs * stride overflow when TK is large (see #1246).
+    row_offs = (row_start + m_offs).to(tl.int64)
+    row_mask = row_offs < expert_end
+    n_idx = n_start + n_offs
+    n_mask = n_idx < I_dim
+
+    acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # int64 prevents token_idx * stride_T overflow at large T*H (see #1246).
+    token_idx = tl.load(x_gather_idx_ptr + row_offs, mask=row_mask, other=0).to(tl.int64)
+    for k in tl.range(0, H_dim, BLOCK_K):
+        k_idx = k + k_offs
+        k_mask = k_idx < H_dim
+
+        x_ptrs = x_ptr + token_idx[:, None] * stride_x_T + k_idx[None, :] * stride_x_H
+        x_tile = tl.load(
+            x_ptrs,
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
+            eviction_policy="evict_first",  # token rows not reused; free L2 for weights
+        )
+
+        w_mask = n_mask[:, None] & k_mask[None, :]
+        w_gate_ptrs = (
+            gate_up_proj_ptr + expert_idx * stride_w_E + n_idx[:, None] * stride_w_N + k_idx[None, :] * stride_w_K
+        )
+        w_gate = tl.load(w_gate_ptrs, mask=w_mask, other=0.0)
+        # Two dots per iteration but through two INDEPENDENT accumulators —
+        # not the triton#10821 single-accumulator pattern.
+        acc_gate = tl.dot(x_tile, tl.trans(w_gate), acc=acc_gate)
+        w_up = tl.load(w_gate_ptrs + I_dim * stride_w_N, mask=w_mask, other=0.0)
+        acc_up = tl.dot(x_tile, tl.trans(w_up), acc=acc_up)
+
+    loc_offs = row_offs - row_lo  # chunk-local staging rows
+    out_mask = row_mask[:, None] & n_mask[None, :]
+    pre_gate_ptrs = pre_act_ptr + loc_offs[:, None] * stride_pre_C + n_idx[None, :] * stride_pre_N
+    tl.store(pre_gate_ptrs, acc_gate.to(pre_act_ptr.dtype.element_ty), mask=out_mask)
+    tl.store(pre_gate_ptrs + I_dim * stride_pre_N, acc_up.to(pre_act_ptr.dtype.element_ty), mask=out_mask)
+
+
+@triton.jit
+def _moe_chunked_bwd_down_proj_kernel(
+    dO_ptr,  # (T, H)   — ∂L/∂O, upstream gradient
+    x_gather_idx_ptr,  # (TK,)    — σ_x: sorted_pos → original token index
+    s_scatter_idx_ptr,  # (TK,)    — σ_s: sorted_pos → flat (t,k) index
+    topk_weights_ptr,  # (TK,)    — s_k: routing weights in flat (t,k) order
+    down_proj_ptr,  # (E, H, I) — W2
+    pre_act_ptr,  # (C, 2I) staging — recomputed [gate, up], chunk-local rows
+    expert_start_ptr,  # (E+1,)   int32
+    tile_row_start_ptr,  # (num_m_tiles,) int32
+    tile_expert_ptr,  # (num_m_tiles,) int32
+    total_tiles_ptr,  # (1,) int32
+    d_pre_act_ptr,  # (C, 2I) staging — output: ∂L/∂z, chunk-local rows
+    weighted_act_ptr,  # (C, I)  staging — output: s_k * y1, chunk-local rows
+    dS_ptr,  # (TK,) fp32 — output: ∂L/∂s_k, GLOBAL flat (t,k) indices (atomic)
+    tile_base,
+    chunk_tiles,
+    H_dim: tl.constexpr,
+    I_dim: tl.constexpr,
+    stride_dO_T,
+    stride_dO_H: tl.constexpr,
+    stride_w_E,
+    stride_w_H,
+    stride_w_I: tl.constexpr,
+    stride_pre_C,
+    stride_pre_N: tl.constexpr,
+    stride_d_pre_C,
+    stride_d_pre_N: tl.constexpr,
+    stride_wact_C,
+    stride_wact_I: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """Chunk-windowed _moe_bwd_down_proj_kernel (pointer-load path): accumulates
+    dA' = dO @ W2^T, recomputes y1 from the staged pre_act, applies SwiGLU
+    backward into chunk-local d_pre_act/weighted_act, and atomically adds dS at
+    global flat (t,k) indices (rows are disjoint across chunks, so cross-chunk
+    dS contributions never collide)."""
+    pid = tl.program_id(0)
+    NUM_PID_N: tl.constexpr = (I_dim + BLOCK_N - 1) // BLOCK_N
+    num_pid_m = tl.minimum(tl.load(total_tiles_ptr) - tile_base, chunk_tiles)
+    if pid >= num_pid_m * NUM_PID_N:
+        return
+    pid_m, pid_n = _grouped_pid_swizzle(pid, num_pid_m, NUM_PID_N, GROUP_M)
+
+    row_lo = tl.load(tile_row_start_ptr + tile_base)
+    row_start = tl.load(tile_row_start_ptr + tile_base + pid_m)
+    # int64 prevents expert_idx * stride_w_E overflow at large E*I*H (see #1246).
+    expert_idx = tl.load(tile_expert_ptr + tile_base + pid_m).to(tl.int64)
+    n_start = pid_n * BLOCK_N
+    expert_end = tl.load(expert_start_ptr + expert_idx + 1)
+
+    m_offs = tl.arange(0, BLOCK_M)
+    n_offs = tl.arange(0, BLOCK_N)
+    k_offs = tl.arange(0, BLOCK_K)
+
+    # int64 prevents row_offs * stride overflow when TK is large (see #1246).
+    row_offs = (row_start + m_offs).to(tl.int64)
+    row_mask = row_offs < expert_end
+    loc_offs = row_offs - row_lo  # chunk-local staging rows
+    n_idx = n_start + n_offs
+    n_mask = n_idx < I_dim
+    out_mask = row_mask[:, None] & n_mask[None, :]
+
+    # Hoist per-row routing metadata (constant across H K-loop).
+    # int64 prevents token_idx * stride_T overflow at large T*H (see #1246).
+    token_idx = tl.load(x_gather_idx_ptr + row_offs, mask=row_mask, other=0).to(tl.int64)
+    flat_tk_idx = tl.load(s_scatter_idx_ptr + row_offs, mask=row_mask, other=0)
+    weights = tl.load(topk_weights_ptr + flat_tk_idx, mask=row_mask, other=0.0).to(tl.float32)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in tl.range(0, H_dim, BLOCK_K):
+        k_idx = k + k_offs
+        k_mask = k_idx < H_dim
+
+        dO_ptrs = dO_ptr + token_idx[:, None] * stride_dO_T + k_idx[None, :] * stride_dO_H
+        dO_tile = tl.load(dO_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+
+        w_ptrs = down_proj_ptr + expert_idx * stride_w_E + k_idx[:, None] * stride_w_H + n_idx[None, :] * stride_w_I
+        w_tile = tl.load(w_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+        acc = tl.dot(dO_tile, w_tile, acc=acc)
+
+    # Epilogue: recompute y1 = silu(gate) * up from the staged pre_act.
+    gate_ptrs = pre_act_ptr + loc_offs[:, None] * stride_pre_C + n_idx[None, :] * stride_pre_N
+    up_ptrs = gate_ptrs + I_dim * stride_pre_N
+    gate = tl.load(gate_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+    up = tl.load(up_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+    sig_gate = tl.sigmoid(gate)
+    silu_gate = gate * sig_gate
+    y1 = silu_gate * up
+
+    wact_ptrs = weighted_act_ptr + loc_offs[:, None] * stride_wact_C + n_idx[None, :] * stride_wact_I
+    tl.store(wact_ptrs, (weights[:, None] * y1).to(weighted_act_ptr.dtype.element_ty), mask=out_mask)
+
+    # dS partials per N-tile: atomic_add (fp32), same as the unchunked path.
+    dS_partial = tl.sum(acc * y1, axis=1)
+    tl.atomic_add(dS_ptr + flat_tk_idx, dS_partial, mask=row_mask)
+
+    # Scale once: dA' = s_k * (dO @ W2^T), then SwiGLU backward.
+    acc = acc * weights[:, None]
+    dgate = acc * (silu_gate * (1.0 - sig_gate) + sig_gate) * up
+    dup = acc * silu_gate
+    dgate_ptrs = d_pre_act_ptr + loc_offs[:, None] * stride_d_pre_C + n_idx[None, :] * stride_d_pre_N
+    tl.store(dgate_ptrs, dgate.to(d_pre_act_ptr.dtype.element_ty), mask=out_mask)
+    tl.store(dgate_ptrs + I_dim * stride_d_pre_N, dup.to(d_pre_act_ptr.dtype.element_ty), mask=out_mask)
+
+
+@triton.jit
+def _moe_chunked_bwd_dX_kernel(
+    d_pre_act_ptr,  # (C, 2*I) staging — chunk-local rows
+    gate_up_proj_ptr,  # (E, 2*I, H) — W1
+    expert_start_ptr,  # (E+1,) int32
+    tile_row_start_ptr,  # (num_m_tiles,) int32
+    tile_expert_ptr,  # (num_m_tiles,) int32
+    total_tiles_ptr,  # (1,) int32
+    dx_staging_ptr,  # (C, H) staging — output, chunk-local rows
+    tile_base,
+    chunk_tiles,
+    H_dim: tl.constexpr,
+    I_dim: tl.constexpr,
+    stride_d_pre_C,
+    stride_d_pre_N: tl.constexpr,
+    stride_w_E,
+    stride_w_N,
+    stride_w_K: tl.constexpr,
+    stride_dxs_C,
+    stride_dxs_H: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """Chunk-windowed _moe_bwd_dX_expanded_kernel (pointer-load path):
+    dx_staging[row - row_lo] = d_pre_act_chunk @ W1[e] as one GEMM over K = 2I.
+    No atomics — staging rows are unique per CTA."""
+    pid = tl.program_id(0)
+    NUM_PID_N: tl.constexpr = (H_dim + BLOCK_N - 1) // BLOCK_N
+    num_pid_m = tl.minimum(tl.load(total_tiles_ptr) - tile_base, chunk_tiles)
+    if pid >= num_pid_m * NUM_PID_N:
+        return
+    pid_m, pid_n = _grouped_pid_swizzle(pid, num_pid_m, NUM_PID_N, GROUP_M)
+
+    row_lo = tl.load(tile_row_start_ptr + tile_base)
+    row_start = tl.load(tile_row_start_ptr + tile_base + pid_m)
+    # int64 prevents expert_idx * stride_w_E overflow at large E*I*H (see #1246).
+    expert_idx = tl.load(tile_expert_ptr + tile_base + pid_m).to(tl.int64)
+    n_start = pid_n * BLOCK_N
+    expert_end = tl.load(expert_start_ptr + expert_idx + 1)
+
+    m_offs = tl.arange(0, BLOCK_M)
+    n_offs = tl.arange(0, BLOCK_N)
+    k_offs = tl.arange(0, BLOCK_K)
+
+    # int64 prevents row_offs * stride overflow when TK is large (see #1246).
+    row_offs = (row_start + m_offs).to(tl.int64)
+    row_mask = row_offs < expert_end
+    loc_offs = row_offs - row_lo  # chunk-local staging rows
+    h_idx = n_start + n_offs
+    h_mask = h_idx < H_dim
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # One GEMM over K = 2I (see _moe_bwd_dX_expanded_kernel: single dot per
+    # accumulator per iteration — required on sm_103, triton#10821).
+    for k in tl.range(0, 2 * I_dim, BLOCK_K):
+        k_idx = k + k_offs
+        k_mask = k_idx < 2 * I_dim
+
+        d_pre_ptrs = d_pre_act_ptr + loc_offs[:, None] * stride_d_pre_C + k_idx[None, :] * stride_d_pre_N
+        d_pre = tl.load(d_pre_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+
+        w_ptrs = gate_up_proj_ptr + expert_idx * stride_w_E + k_idx[:, None] * stride_w_N + h_idx[None, :] * stride_w_K
+        w_tile = tl.load(w_ptrs, mask=k_mask[:, None] & h_mask[None, :], other=0.0)
+
+        acc = tl.dot(d_pre, w_tile, acc=acc)
+
+    dxs_ptrs = dx_staging_ptr + loc_offs[:, None] * stride_dxs_C + h_idx[None, :] * stride_dxs_H
+    tl.store(dxs_ptrs, acc.to(dx_staging_ptr.dtype.element_ty), mask=row_mask[:, None] & h_mask[None, :])
+
+
+@triton.jit
+def _moe_chunked_bwd_dW2_kernel(
+    weighted_act_ptr,  # (C, I) staging — s_k * y1, chunk-local rows
+    dout_ptr,  # (T, H)  — upstream gradient (gathered by x_gather_idx)
+    x_gather_idx_ptr,  # (TK,)   — sorted_pos → original token index
+    expert_start_ptr,  # (E+1,)  int32
+    tile_row_start_ptr,  # (num_m_tiles,) int32
+    total_tiles_ptr,  # (1,) int32
+    dW2_acc_ptr,  # (E, H, I) fp32 — cross-chunk accumulator (read-modify-write)
+    tile_base,
+    chunk_tiles,
+    TK_total,
+    H_dim: tl.constexpr,
+    I_dim: tl.constexpr,
+    stride_wact_C,
+    stride_wact_I: tl.constexpr,
+    stride_dout_T,
+    stride_dout_H: tl.constexpr,
+    stride_dW2_E,
+    stride_dW2_H,
+    stride_dW2_I: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """dW2[e] += (s_k*y1)^T @ dO over this chunk's slice of expert e's rows.
+
+    Grid: (E * ceil(I/BLOCK_M) * ceil(H/BLOCK_N),) — each output tile has
+    exactly one writer per launch, and the same writer across launches
+    (serialized by the chunk loop) → deterministic accumulation, no atomics.
+    Experts with no rows in the window exit before touching the accumulator."""
+    pid = tl.program_id(0)
+    total_tiles = tl.load(total_tiles_ptr)
+    if tile_base >= total_tiles:
+        return
+    row_lo, row_hi = _chunk_row_bounds(tile_row_start_ptr, total_tiles, tile_base, chunk_tiles, TK_total)
+
+    N_M_TILES: tl.constexpr = (I_dim + BLOCK_M - 1) // BLOCK_M
+    N_N_TILES: tl.constexpr = (H_dim + BLOCK_N - 1) // BLOCK_N
+    TILES_PER_E: tl.constexpr = N_M_TILES * N_N_TILES
+    # int64 prevents expert_idx * stride_dW_E overflow at large E*I*H (see #1246).
+    expert_idx = (pid // TILES_PER_E).to(tl.int64)
+    local = pid % TILES_PER_E
+    m_tile, n_tile = _grouped_pid_swizzle(local, N_M_TILES, N_N_TILES, GROUP_M)
+
+    expert_start = tl.load(expert_start_ptr + expert_idx)
+    expert_end = tl.load(expert_start_ptr + expert_idx + 1)
+    seg_lo = tl.maximum(expert_start, row_lo)
+    seg_hi = tl.minimum(expert_end, row_hi)
+    M_seg = seg_hi - seg_lo
+    if M_seg <= 0:
+        return
+
+    m_offs = tl.arange(0, BLOCK_M)
+    n_offs = tl.arange(0, BLOCK_N)
+    k_offs = tl.arange(0, BLOCK_K)
+
+    i_idx = m_tile * BLOCK_M + m_offs
+    h_idx = n_tile * BLOCK_N + n_offs
+    i_mask = i_idx < I_dim
+    h_mask = h_idx < H_dim
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in tl.range(0, M_seg, BLOCK_K):
+        k_idx = k + k_offs
+        k_mask = k_idx < M_seg
+        row_offs = (seg_lo + k_idx).to(tl.int64)
+        loc_offs = row_offs - row_lo  # chunk-local staging rows
+
+        wact_ptrs = weighted_act_ptr + loc_offs[None, :] * stride_wact_C + i_idx[:, None] * stride_wact_I
+        wact_tile = tl.load(wact_ptrs, mask=k_mask[None, :] & i_mask[:, None], other=0.0)
+
+        # int64 prevents token_idx * stride_T overflow at large T*H (see #1246).
+        token_idx = tl.load(x_gather_idx_ptr + row_offs, mask=k_mask, other=0).to(tl.int64)
+        dout_ptrs = dout_ptr + token_idx[:, None] * stride_dout_T + h_idx[None, :] * stride_dout_H
+        dout_tile = tl.load(dout_ptrs, mask=k_mask[:, None] & h_mask[None, :], other=0.0)
+
+        acc = tl.dot(wact_tile, dout_tile, acc=acc)
+
+    out_mask = i_mask[:, None] & h_mask[None, :]
+    dW2_ptrs = dW2_acc_ptr + expert_idx * stride_dW2_E + h_idx[None, :] * stride_dW2_H + i_idx[:, None] * stride_dW2_I
+    prev = tl.load(dW2_ptrs, mask=out_mask, other=0.0)
+    tl.store(dW2_ptrs, (prev + acc).to(dW2_acc_ptr.dtype.element_ty), mask=out_mask)
+
+
+@triton.jit
+def _moe_chunked_bwd_dW1_kernel(
+    x_ptr,  # (T, H)
+    d_pre_act_ptr,  # (C, 2*I) staging — chunk-local rows
+    x_gather_idx_ptr,  # (TK,) int32
+    expert_start_ptr,  # (E+1,) int32
+    tile_row_start_ptr,  # (num_m_tiles,) int32
+    total_tiles_ptr,  # (1,) int32
+    dW1_acc_ptr,  # (E, 2*I, H) fp32 — cross-chunk accumulator (read-modify-write)
+    tile_base,
+    chunk_tiles,
+    TK_total,
+    H_dim: tl.constexpr,
+    I_dim: tl.constexpr,
+    stride_x_T,
+    stride_x_H: tl.constexpr,
+    stride_d_pre_C,
+    stride_d_pre_N: tl.constexpr,
+    stride_dW1_E,
+    stride_dW1_N,
+    stride_dW1_H: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """dW1[e] += X_gathered^T @ d_pre_act over this chunk's slice of expert e's
+    rows. Same single-writer read-modify-write structure as the chunked dW2."""
+    pid = tl.program_id(0)
+    total_tiles = tl.load(total_tiles_ptr)
+    if tile_base >= total_tiles:
+        return
+    row_lo, row_hi = _chunk_row_bounds(tile_row_start_ptr, total_tiles, tile_base, chunk_tiles, TK_total)
+
+    N_M_TILES: tl.constexpr = (H_dim + BLOCK_M - 1) // BLOCK_M
+    N_N_TILES: tl.constexpr = (2 * I_dim + BLOCK_N - 1) // BLOCK_N
+    TILES_PER_E: tl.constexpr = N_M_TILES * N_N_TILES
+    # int64 prevents expert_idx * stride_dW_E overflow at large E*I*H (see #1246).
+    expert_idx = (pid // TILES_PER_E).to(tl.int64)
+    local = pid % TILES_PER_E
+    m_tile, n_tile = _grouped_pid_swizzle(local, N_M_TILES, N_N_TILES, GROUP_M)
+
+    expert_start = tl.load(expert_start_ptr + expert_idx)
+    expert_end = tl.load(expert_start_ptr + expert_idx + 1)
+    seg_lo = tl.maximum(expert_start, row_lo)
+    seg_hi = tl.minimum(expert_end, row_hi)
+    M_seg = seg_hi - seg_lo
+    if M_seg <= 0:
+        return
+
+    m_offs = tl.arange(0, BLOCK_M)
+    n_offs = tl.arange(0, BLOCK_N)
+    k_offs = tl.arange(0, BLOCK_K)
+
+    h_idx = m_tile * BLOCK_M + m_offs
+    n_idx = n_tile * BLOCK_N + n_offs
+    h_mask = h_idx < H_dim
+    n_mask = n_idx < 2 * I_dim
+
+    acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+
+    for k in tl.range(0, M_seg, BLOCK_K):
+        k_idx = k + k_offs
+        k_mask = k_idx < M_seg
+        row_offs = (seg_lo + k_idx).to(tl.int64)
+        loc_offs = row_offs - row_lo  # chunk-local staging rows
+
+        # int64 prevents token_idx * stride_T overflow at large T*H (see #1246).
+        token_idx = tl.load(x_gather_idx_ptr + row_offs, mask=k_mask, other=0).to(tl.int64)
+        x_ptrs = x_ptr + token_idx[:, None] * stride_x_T + h_idx[None, :] * stride_x_H
+        x_tile = tl.load(x_ptrs, mask=k_mask[:, None] & h_mask[None, :], other=0.0)
+
+        d_pre_ptrs = d_pre_act_ptr + loc_offs[:, None] * stride_d_pre_C + n_idx[None, :] * stride_d_pre_N
+        d_pre_tile = tl.load(d_pre_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+
+        acc = tl.dot(tl.trans(d_pre_tile), x_tile, acc=acc)
+
+    out_mask = n_mask[:, None] & h_mask[None, :]
+    dW1_ptrs = dW1_acc_ptr + expert_idx * stride_dW1_E + n_idx[:, None] * stride_dW1_N + h_idx[None, :] * stride_dW1_H
+    prev = tl.load(dW1_ptrs, mask=out_mask, other=0.0)
+    tl.store(dW1_ptrs, (prev + acc).to(dW1_acc_ptr.dtype.element_ty), mask=out_mask)
+
+
+@triton.jit
+def _moe_chunked_dx_add_kernel(
+    dx_staging_ptr,  # (C, H) staging — chunk-local rows
+    s_rev_ptr,  # (TK,) int32 s_reverse_scatter_idx: flat (t,k) → sorted position
+    tile_row_start_ptr,  # (num_m_tiles,) int32
+    total_tiles_ptr,  # (1,) int32
+    dx_ptr,  # (T, H) fp32 — cross-chunk accumulator (read-modify-write)
+    tile_base,
+    chunk_tiles,
+    TK_total,
+    H_dim: tl.constexpr,
+    K_dim: tl.constexpr,
+    stride_dxs_C,
+    stride_dxs_H: tl.constexpr,
+    stride_dx_T,
+    stride_dx_H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    K_POW2: tl.constexpr,
+):
+    """Deterministic segmented reduce: dx[t] += sum of this chunk's dx_staging
+    rows among token t's K assignments (_token_gather_weighted_sum_kernel
+    pattern, extended with the chunk-window filter and fp32 accumulation).
+
+    Grid: (T, ceil(H/BLOCK_H)) — single writer per (t, h-tile), no atomics.
+    Tokens with zero in-chunk rows exit after K comparisons without touching
+    the accumulator."""
+    total_tiles = tl.load(total_tiles_ptr)
+    if tile_base >= total_tiles:
+        return
+    row_lo, row_hi = _chunk_row_bounds(tile_row_start_ptr, total_tiles, tile_base, chunk_tiles, TK_total)
+
+    # int64 prevents t * stride overflow at large T*H (see #1246).
+    t = tl.program_id(0).to(tl.int64)
+    h_tile = tl.program_id(1)
+
+    k_offs = tl.arange(0, K_POW2)
+    k_mask = k_offs < K_dim
+    pos = tl.load(s_rev_ptr + t * K_dim + k_offs, mask=k_mask, other=-1)
+    in_chunk = k_mask & (pos >= row_lo) & (pos < row_hi)
+    if tl.sum(in_chunk.to(tl.int32)) == 0:
+        return
+
+    h_idx = h_tile * BLOCK_H + tl.arange(0, BLOCK_H)
+    h_mask = h_idx < H_dim
+
+    loc = tl.where(in_chunk, pos - row_lo, 0).to(tl.int64)
+    vals = tl.load(
+        dx_staging_ptr + loc[:, None] * stride_dxs_C + h_idx[None, :] * stride_dxs_H,
+        mask=in_chunk[:, None] & h_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    add = tl.sum(vals, axis=0)
+
+    out_ptrs = dx_ptr + t * stride_dx_T + h_idx * stride_dx_H
+    prev = tl.load(out_ptrs, mask=h_mask, other=0.0)
+    tl.store(out_ptrs, prev + add, mask=h_mask)

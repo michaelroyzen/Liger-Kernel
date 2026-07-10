@@ -400,6 +400,10 @@ class LigerFusedMoEFunction(torch.autograd.Function):
             BLOCK_K=ASCEND_DW_BLOCK_K,
         )
 
+        # TODO: this TK-scaled buffer family (dx_expanded, d_pre_act, pre_act,
+        # weighted_act) has a token-chunked, fixed-staging alternative on the
+        # CUDA path (LIGER_FUSED_MOE_CHUNK_TILES in liger_kernel.ops.fused_moe);
+        # port it here if long-context workloads OOM on this backend.
         dx_expanded = torch.empty(TK, H, dtype=dO.dtype, device=dO.device)
         if num_m_tiles > 0:
             _moe_bwd_dX_expanded_kernel[(num_m_tiles,)](

@@ -25,19 +25,48 @@ Env flags:
   saves TK*I*itemsize bytes). Combined ≈ −1.2 GB peak at T=32768/I=768/bf16 for a
   ~10-15% slower backward. In this mode a second backward over the same graph
   (retain_graph) raises a version-counter error — by design.
+- LIGER_FUSED_MOE_CHUNK_TILES=N (N > 0; read at forward time; default 0 = off):
+  token-chunked backward. The backward walks the expert-grouped GEMM M-tiles in
+  fixed windows of N tiles, recomputing pre_act per window, so every
+  TK-proportional buffer (pre_act, d_pre_act, weighted_act, dx_expanded) is
+  capped at N * BLOCK_M rows of staging. Forward never stores pre_act in this
+  mode (training forward memory drops too). Cross-chunk accumulation (dx, dW1,
+  dW2) is fp32, serial and single-writer → bitwise reproducible run-to-run
+  (dS keeps its pre-existing fp32 atomics). Results differ from the unchunked
+  path only by summation order. Chunked mode supersedes — and ignores —
+  LIGER_FUSED_MOE_MEMORY_EFFICIENT.
 """
+
+import os
 
 import torch
 import triton
 
 import liger_kernel.ops.fused_moe_kernels as _kernels_mod
 
+from liger_kernel.ops.fused_moe_kernels import _CHUNKED_BLOCK_K
+from liger_kernel.ops.fused_moe_kernels import _CHUNKED_BLOCK_N
+from liger_kernel.ops.fused_moe_kernels import _CHUNKED_DW_BLOCK_K
+from liger_kernel.ops.fused_moe_kernels import _CHUNKED_DW_BLOCK_M
+from liger_kernel.ops.fused_moe_kernels import _CHUNKED_DW_BLOCK_N
+from liger_kernel.ops.fused_moe_kernels import _CHUNKED_DW_GROUP_M
+from liger_kernel.ops.fused_moe_kernels import _CHUNKED_DX_ADD_BLOCK_H
+from liger_kernel.ops.fused_moe_kernels import _CHUNKED_DX_ADD_NUM_WARPS
+from liger_kernel.ops.fused_moe_kernels import _CHUNKED_GROUP_M
+from liger_kernel.ops.fused_moe_kernels import _CHUNKED_NUM_STAGES
+from liger_kernel.ops.fused_moe_kernels import _CHUNKED_NUM_WARPS
 from liger_kernel.ops.fused_moe_kernels import _fused_down_proj_kernel
 from liger_kernel.ops.fused_moe_kernels import _fused_up_proj_swiglu_kernel
 from liger_kernel.ops.fused_moe_kernels import _moe_bwd_down_proj_kernel
 from liger_kernel.ops.fused_moe_kernels import _moe_bwd_dW1_kernel
 from liger_kernel.ops.fused_moe_kernels import _moe_bwd_dW2_kernel
 from liger_kernel.ops.fused_moe_kernels import _moe_bwd_dX_expanded_kernel
+from liger_kernel.ops.fused_moe_kernels import _moe_chunked_bwd_down_proj_kernel
+from liger_kernel.ops.fused_moe_kernels import _moe_chunked_bwd_dW1_kernel
+from liger_kernel.ops.fused_moe_kernels import _moe_chunked_bwd_dW2_kernel
+from liger_kernel.ops.fused_moe_kernels import _moe_chunked_bwd_dX_kernel
+from liger_kernel.ops.fused_moe_kernels import _moe_chunked_dx_add_kernel
+from liger_kernel.ops.fused_moe_kernels import _moe_chunked_pre_act_recompute_kernel
 from liger_kernel.ops.fused_moe_kernels import _moe_router_histogram_kernel
 from liger_kernel.ops.fused_moe_kernels import _moe_router_prefix_sum_kernel
 from liger_kernel.ops.fused_moe_kernels import _moe_router_scatter_kernel
@@ -49,6 +78,17 @@ from liger_kernel.ops.utils import ensure_contiguous
 # Must be set before importing liger_kernel (the kernels module reads it at import
 # to configure the autotuner's restore_value for the in-place alias).
 _MEMORY_EFFICIENT = _kernels_mod._MEMORY_EFFICIENT
+
+
+def _chunk_tiles_setting() -> int:
+    """LIGER_FUSED_MOE_CHUNK_TILES, read at forward-call time (0 = chunking off).
+
+    Read per call (not at import) so the mode can be toggled between steps; the
+    value is captured in ctx at forward so forward/backward always agree."""
+    try:
+        return max(0, int(os.environ.get("LIGER_FUSED_MOE_CHUNK_TILES", "0")))
+    except ValueError:
+        return 0
 
 
 # Device-side TMA descriptors (tl.make_tensor_descriptor) need a global-memory
@@ -221,6 +261,265 @@ def _token_aggregation(Y, topk_weights_flat, s_reverse_scatter_idx, T, K, H):
 
 
 # ---------------------------------------------------------------------------
+# Chunked backward (LIGER_FUSED_MOE_CHUNK_TILES > 0)
+# ---------------------------------------------------------------------------
+
+
+def _moe_backward_chunked(
+    dO,
+    x,
+    gate_up_proj,
+    down_proj,
+    topk_weights_flat,
+    expert_start_idx,
+    x_gather_idx,
+    s_scatter_idx,
+    s_reverse_scatter_idx,
+    tile_row_start,
+    tile_expert,
+    total_tiles_dev,
+    T: int,
+    K: int,
+    E: int,
+    H: int,
+    intermediate_dim: int,
+    TK: int,
+    num_m_tiles: int,
+    block_m_token: int,
+    chunk_tiles: int,
+):
+    """Token-chunked MoE backward with deterministic dX/dW reduction.
+
+    Walks the expert-grouped M-tiles in fixed ascending windows of
+    ``chunk_tiles`` tiles. Per window: recompute pre_act (never stored by
+    forward in this mode) → SwiGLU/down-proj backward → dW1/dW2 accumulation →
+    dX GEMM → segmented token-gather add into dx. Staging buffers are sized by
+    the window (C = chunk_tiles * BLOCK_M rows); cross-chunk accumulators
+    (dx, dW1, dW2) are fp32 with a single final cast.
+
+    Determinism: the chunk loop is serial and every accumulation is
+    single-writer (no float atomics beyond the pre-existing dS), so gradients
+    are bitwise reproducible run-to-run. Values differ from the unchunked
+    backward only by fp32 summation order.
+
+    No CPU sync: windows are bounded by the host-side tile-count upper bound
+    (num_m_tiles); kernels clamp against the device-side actual count.
+    """
+    device = dO.device
+    I = intermediate_dim
+
+    # fp32 cross-chunk accumulators (zeros: kernels only touch rows/tiles with
+    # in-window contributions).
+    dx = torch.zeros(T, H, dtype=torch.float32, device=device)
+    dgate_up_proj = torch.zeros(gate_up_proj.shape, dtype=torch.float32, device=device)
+    ddown_proj = torch.zeros(down_proj.shape, dtype=torch.float32, device=device)
+    # fp32 dS: atomic_add accumulates ceil(I/BLOCK_N) partials per element
+    # (same rationale as the unchunked path).
+    dS = torch.zeros(TK, dtype=torch.float32, device=device)
+
+    if num_m_tiles > 0 and TK > 0:
+        chunk_tiles = min(chunk_tiles, num_m_tiles)
+        C = chunk_tiles * block_m_token  # staging row capacity per window
+
+        # Staging buffers, allocated once and reused across windows (input dtype).
+        pre_act_chunk = torch.empty(C, 2 * I, dtype=dO.dtype, device=device)
+        d_pre_act_chunk = torch.empty(C, 2 * I, dtype=dO.dtype, device=device)
+        weighted_act_chunk = torch.empty(C, I, dtype=dO.dtype, device=device)
+        dx_staging = torch.empty(C, H, dtype=dO.dtype, device=device)
+
+        # Fixed grids for every window (the last window is padded, not
+        # specialized): kernels early-exit past the device-side tile count.
+        grid_tiles_I = (chunk_tiles * triton.cdiv(I, _CHUNKED_BLOCK_N),)
+        grid_tiles_H = (chunk_tiles * triton.cdiv(H, _CHUNKED_BLOCK_N),)
+        grid_dW2 = (E * triton.cdiv(I, _CHUNKED_DW_BLOCK_M) * triton.cdiv(H, _CHUNKED_DW_BLOCK_N),)
+        grid_dW1 = (E * triton.cdiv(H, _CHUNKED_DW_BLOCK_M) * triton.cdiv(2 * I, _CHUNKED_DW_BLOCK_N),)
+        grid_dx_add = (T, triton.cdiv(H, _CHUNKED_DX_ADD_BLOCK_H))
+
+        for tile_base in range(0, num_m_tiles, chunk_tiles):
+            # 1. Recompute pre_act for this window from x and W1.
+            _moe_chunked_pre_act_recompute_kernel[grid_tiles_I](
+                x,
+                gate_up_proj,
+                x_gather_idx,
+                expert_start_idx,
+                tile_row_start,
+                tile_expert,
+                total_tiles_dev,
+                pre_act_chunk,
+                tile_base,
+                chunk_tiles,
+                H_dim=H,
+                I_dim=I,
+                stride_x_T=x.stride(0),
+                stride_x_H=x.stride(1),
+                stride_w_E=gate_up_proj.stride(0),
+                stride_w_N=gate_up_proj.stride(1),
+                stride_w_K=gate_up_proj.stride(2),
+                stride_pre_C=pre_act_chunk.stride(0),
+                stride_pre_N=pre_act_chunk.stride(1),
+                BLOCK_M=block_m_token,
+                BLOCK_N=_CHUNKED_BLOCK_N,
+                BLOCK_K=_CHUNKED_BLOCK_K,
+                GROUP_M=_CHUNKED_GROUP_M,
+                num_warps=_CHUNKED_NUM_WARPS,
+                num_stages=_CHUNKED_NUM_STAGES,
+            )
+
+            # 2. dA' = dO @ W2^T, SwiGLU backward → d_pre_act, weighted_act, dS.
+            _moe_chunked_bwd_down_proj_kernel[grid_tiles_I](
+                dO,
+                x_gather_idx,
+                s_scatter_idx,
+                topk_weights_flat,
+                down_proj,
+                pre_act_chunk,
+                expert_start_idx,
+                tile_row_start,
+                tile_expert,
+                total_tiles_dev,
+                d_pre_act_chunk,
+                weighted_act_chunk,
+                dS,
+                tile_base,
+                chunk_tiles,
+                H_dim=H,
+                I_dim=I,
+                stride_dO_T=dO.stride(0),
+                stride_dO_H=dO.stride(1),
+                stride_w_E=down_proj.stride(0),
+                stride_w_H=down_proj.stride(1),
+                stride_w_I=down_proj.stride(2),
+                stride_pre_C=pre_act_chunk.stride(0),
+                stride_pre_N=pre_act_chunk.stride(1),
+                stride_d_pre_C=d_pre_act_chunk.stride(0),
+                stride_d_pre_N=d_pre_act_chunk.stride(1),
+                stride_wact_C=weighted_act_chunk.stride(0),
+                stride_wact_I=weighted_act_chunk.stride(1),
+                BLOCK_M=block_m_token,
+                BLOCK_N=_CHUNKED_BLOCK_N,
+                BLOCK_K=_CHUNKED_BLOCK_K,
+                GROUP_M=_CHUNKED_GROUP_M,
+                num_warps=_CHUNKED_NUM_WARPS,
+                num_stages=_CHUNKED_NUM_STAGES,
+            )
+
+            # 3. dW2 += (s_k*y1)^T @ dO over the window's rows.
+            _moe_chunked_bwd_dW2_kernel[grid_dW2](
+                weighted_act_chunk,
+                dO,
+                x_gather_idx,
+                expert_start_idx,
+                tile_row_start,
+                total_tiles_dev,
+                ddown_proj,
+                tile_base,
+                chunk_tiles,
+                TK,
+                H_dim=H,
+                I_dim=I,
+                stride_wact_C=weighted_act_chunk.stride(0),
+                stride_wact_I=weighted_act_chunk.stride(1),
+                stride_dout_T=dO.stride(0),
+                stride_dout_H=dO.stride(1),
+                stride_dW2_E=ddown_proj.stride(0),
+                stride_dW2_H=ddown_proj.stride(1),
+                stride_dW2_I=ddown_proj.stride(2),
+                BLOCK_M=_CHUNKED_DW_BLOCK_M,
+                BLOCK_N=_CHUNKED_DW_BLOCK_N,
+                BLOCK_K=_CHUNKED_DW_BLOCK_K,
+                GROUP_M=_CHUNKED_DW_GROUP_M,
+                num_warps=_CHUNKED_NUM_WARPS,
+                num_stages=_CHUNKED_NUM_STAGES,
+            )
+
+            # 4. dW1 += X_gathered^T @ d_pre_act over the window's rows.
+            _moe_chunked_bwd_dW1_kernel[grid_dW1](
+                x,
+                d_pre_act_chunk,
+                x_gather_idx,
+                expert_start_idx,
+                tile_row_start,
+                total_tiles_dev,
+                dgate_up_proj,
+                tile_base,
+                chunk_tiles,
+                TK,
+                H_dim=H,
+                I_dim=I,
+                stride_x_T=x.stride(0),
+                stride_x_H=x.stride(1),
+                stride_d_pre_C=d_pre_act_chunk.stride(0),
+                stride_d_pre_N=d_pre_act_chunk.stride(1),
+                stride_dW1_E=dgate_up_proj.stride(0),
+                stride_dW1_N=dgate_up_proj.stride(1),
+                stride_dW1_H=dgate_up_proj.stride(2),
+                BLOCK_M=_CHUNKED_DW_BLOCK_M,
+                BLOCK_N=_CHUNKED_DW_BLOCK_N,
+                BLOCK_K=_CHUNKED_DW_BLOCK_K,
+                GROUP_M=_CHUNKED_DW_GROUP_M,
+                num_warps=_CHUNKED_NUM_WARPS,
+                num_stages=_CHUNKED_NUM_STAGES,
+            )
+
+            # 5. dx_staging = d_pre_act @ W1[expert] (chunk-local rows).
+            _moe_chunked_bwd_dX_kernel[grid_tiles_H](
+                d_pre_act_chunk,
+                gate_up_proj,
+                expert_start_idx,
+                tile_row_start,
+                tile_expert,
+                total_tiles_dev,
+                dx_staging,
+                tile_base,
+                chunk_tiles,
+                H_dim=H,
+                I_dim=I,
+                stride_d_pre_C=d_pre_act_chunk.stride(0),
+                stride_d_pre_N=d_pre_act_chunk.stride(1),
+                stride_w_E=gate_up_proj.stride(0),
+                stride_w_N=gate_up_proj.stride(1),
+                stride_w_K=gate_up_proj.stride(2),
+                stride_dxs_C=dx_staging.stride(0),
+                stride_dxs_H=dx_staging.stride(1),
+                BLOCK_M=block_m_token,
+                BLOCK_N=_CHUNKED_BLOCK_N,
+                BLOCK_K=_CHUNKED_BLOCK_K,
+                GROUP_M=_CHUNKED_GROUP_M,
+                num_warps=_CHUNKED_NUM_WARPS,
+                num_stages=_CHUNKED_NUM_STAGES,
+            )
+
+            # 6. Deterministic segmented reduce: dx[t] += in-window staging rows.
+            _moe_chunked_dx_add_kernel[grid_dx_add](
+                dx_staging,
+                s_reverse_scatter_idx,
+                tile_row_start,
+                total_tiles_dev,
+                dx,
+                tile_base,
+                chunk_tiles,
+                TK,
+                H_dim=H,
+                K_dim=K,
+                stride_dxs_C=dx_staging.stride(0),
+                stride_dxs_H=dx_staging.stride(1),
+                stride_dx_T=dx.stride(0),
+                stride_dx_H=dx.stride(1),
+                BLOCK_H=_CHUNKED_DX_ADD_BLOCK_H,
+                K_POW2=triton.next_power_of_2(K),
+                num_warps=_CHUNKED_DX_ADD_NUM_WARPS,
+            )
+
+    return (
+        dx.to(dO.dtype),
+        dgate_up_proj.to(gate_up_proj.dtype),
+        ddown_proj.to(down_proj.dtype),
+        None,
+        dS.to(topk_weights_flat.dtype).view(T, K),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Autograd Function
 # ---------------------------------------------------------------------------
 
@@ -241,6 +540,11 @@ class LigerFusedMoEFunction(torch.autograd.Function):
         Set ``LIGER_FUSED_MOE_MEMORY_EFFICIENT=1`` to shave another ~TK*3I*itemsize
         bytes off backward peak memory (in-place SwiGLU backward + weighted_act
         recompute) at ~10-15% slower backward; retain_graph re-backward then raises.
+
+        Set ``LIGER_FUSED_MOE_CHUNK_TILES=N`` (N > 0) to cap every TK-proportional
+        backward buffer at N GEMM-tiles of staging (token-chunked backward with
+        per-window pre_act recompute and fp32 cross-chunk accumulators; bitwise
+        reproducible run-to-run). Supersedes LIGER_FUSED_MOE_MEMORY_EFFICIENT.
     """
 
     @staticmethod
@@ -270,6 +574,10 @@ class LigerFusedMoEFunction(torch.autograd.Function):
         needs_grad = (
             x.requires_grad or gate_up_proj.requires_grad or down_proj.requires_grad or (top_k_weights.requires_grad)
         )
+        # Chunked backward recomputes pre_act per tile window, so training
+        # forward also skips the (TK, 2I) pre_act store.
+        chunk_tiles = _chunk_tiles_setting() if needs_grad else 0
+        store_preact = needs_grad and chunk_tiles == 0
 
         with torch.no_grad():
             (
@@ -287,9 +595,10 @@ class LigerFusedMoEFunction(torch.autograd.Function):
         total_tiles_dev = expert_tile_offset[E:]
 
         post_act = torch.empty(TK, intermediate_dim, dtype=x.dtype, device=x.device)
-        # pre_act only exists in training; in inference the kernel skips the store
-        # entirely (post_act doubles as a dummy pointer that is never written).
-        pre_act = torch.empty(TK, 2 * intermediate_dim, dtype=x.dtype, device=x.device) if needs_grad else post_act
+        # pre_act only exists in unchunked training; in inference and chunked
+        # mode the kernel skips the store entirely (post_act doubles as a dummy
+        # pointer that is never written).
+        pre_act = torch.empty(TK, 2 * intermediate_dim, dtype=x.dtype, device=x.device) if store_preact else post_act
 
         if num_m_tiles > 0:
             _fused_up_proj_swiglu_kernel[lambda meta: (num_m_tiles * triton.cdiv(intermediate_dim, meta["BLOCK_N"]),)](
@@ -316,7 +625,7 @@ class LigerFusedMoEFunction(torch.autograd.Function):
                 stride_post_N=post_act.stride(1),
                 BLOCK_M=block_m_token,
                 USE_TMA=use_tma_w1,
-                STORE_PREACT=needs_grad,
+                STORE_PREACT=store_preact,
             )
 
         Y = torch.empty(TK, H, dtype=x.dtype, device=x.device)
@@ -352,7 +661,10 @@ class LigerFusedMoEFunction(torch.autograd.Function):
                 x,
                 gate_up_proj,
                 down_proj,
-                pre_act,
+                # Chunked mode never stored pre_act; save a 0-size placeholder
+                # so the saved-tensor layout stays uniform (post_act must not be
+                # kept alive through the backward window).
+                pre_act if store_preact else x.new_empty(0),
                 topk_weights_flat,
                 expert_start_idx,
                 x_gather_idx,
@@ -362,6 +674,7 @@ class LigerFusedMoEFunction(torch.autograd.Function):
                 tile_expert,
                 total_tiles_dev,
             )
+        ctx.chunk_tiles = chunk_tiles
         ctx.T = T
         ctx.K = K
         ctx.E = E
@@ -404,6 +717,34 @@ class LigerFusedMoEFunction(torch.autograd.Function):
         TK = ctx.TK
         num_m_tiles = ctx.num_m_tiles
         block_m_token = ctx.block_m_token
+
+        if ctx.chunk_tiles > 0:
+            # Token-chunked backward: pre_act was never stored (recomputed per
+            # tile window); supersedes LIGER_FUSED_MOE_MEMORY_EFFICIENT.
+            return _moe_backward_chunked(
+                dO,
+                x,
+                gate_up_proj,
+                down_proj,
+                topk_weights_flat,
+                expert_start_idx,
+                x_gather_idx,
+                s_scatter_idx,
+                s_reverse_scatter_idx,
+                tile_row_start,
+                tile_expert,
+                total_tiles_dev,
+                T=T,
+                K=K,
+                E=E,
+                H=H,
+                intermediate_dim=intermediate_dim,
+                TK=TK,
+                num_m_tiles=num_m_tiles,
+                block_m_token=block_m_token,
+                chunk_tiles=ctx.chunk_tiles,
+            )
+
         use_tma_w1, use_tma_w2 = _tma_eligibility(dO, H, intermediate_dim, E)
         if use_tma_w1 or use_tma_w2:
             _ensure_tma_allocator()
