@@ -1673,7 +1673,8 @@ def test_apply_liger_kernel_to_instance_for_deepseek_v32():
                 assert inspect.getsource(layer.mlp.shared_experts.forward) == inspect.getsource(
                     LigerQwen3MoeSwiGLUMLP.forward
                 )
-                assert inspect.getsource(layer.mlp.experts.forward) != inspect.getsource(LigerQwen3MoeSwiGLUMLP.forward)
+                # Routed experts run the fused grouped-GEMM MoE kernel.
+                assert inspect.getsource(layer.mlp.experts.forward) == inspect.getsource(LigerExperts.forward)
             else:
                 assert inspect.getsource(layer.mlp.forward) == inspect.getsource(LigerQwen3MoeSwiGLUMLP.forward)
             assert inspect.getsource(layer.input_layernorm.forward) == inspect.getsource(LigerRMSNorm.forward)

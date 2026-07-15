@@ -3477,7 +3477,11 @@ def apply_liger_kernel_to_deepseek_v32(
             `cross_entropy` and `fused_linear_cross_entropy` cannot both be True.
             If `fused_linear_cross_entropy` is True, the logits will not be materialized but more memory efficient.
         rms_norm (bool): Whether to apply Liger's RMSNorm. Default is True.
-        swiglu (bool): Whether to apply Liger's SwiGLU MLP. Default is True.
+        swiglu (bool): Whether to apply Liger's SwiGLU kernels. Default is True. Patches the
+            dense MLPs and MoE shared experts with LigerSiLUMul, and the routed experts
+            (DeepseekV32Experts stores fused 3D gate_up_proj/down_proj weights, same layout
+            as Qwen3-MoE) with Liger's fused grouped-GEMM MoE (Triton, TMA weight loads on
+            Hopper+, Blackwell-extended autotune space) instead of the eager per-expert loop.
         model (PreTrainedModel): The model instance to apply Liger kernels to, if already loaded.
             Default is None.
     """
@@ -3489,6 +3493,7 @@ def apply_liger_kernel_to_deepseek_v32(
     from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32Model
 
     from liger_kernel.transformers.model.deepseek_v32 import lce_forward as deepseek_v32_lce_forward
+    from liger_kernel.transformers.swiglu import LigerExperts
     from liger_kernel.transformers.swiglu import LigerQwen3MoeSwiGLUMLP
 
     if rope:
@@ -3513,6 +3518,9 @@ def apply_liger_kernel_to_deepseek_v32(
 
     if swiglu:
         modeling_deepseek_v32.DeepseekV32MLP = LigerQwen3MoeSwiGLUMLP
+        # Routed experts: fused grouped-GEMM MoE (weights are already packed 3D
+        # (E, 2I, H)/(E, H, I) tensors with the same [gate; up] layout LigerExperts uses).
+        modeling_deepseek_v32.DeepseekV32Experts = LigerExperts
 
     if model is not None:
         base_model: DeepseekV32Model = getattr(model, model.base_model_prefix, model)
@@ -3526,6 +3534,9 @@ def apply_liger_kernel_to_deepseek_v32(
                     _patch_swiglu_module(shared_experts, LigerQwen3MoeSwiGLUMLP)
                 else:
                     _patch_swiglu_module(decoder_layer.mlp, LigerQwen3MoeSwiGLUMLP)
+                routed_experts = getattr(decoder_layer.mlp, "experts", None)
+                if routed_experts is not None:
+                    _patch_swiglu_module(routed_experts, LigerExperts)
             if rms_norm:
                 _patch_rms_norm_module(decoder_layer.input_layernorm)
                 _patch_rms_norm_module(decoder_layer.post_attention_layernorm)
