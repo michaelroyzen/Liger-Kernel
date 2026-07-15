@@ -21,7 +21,15 @@ sm_103 (B300) notes:
     gets a fresh accumulator, so the buggy pattern never occurs.
   - Launch configs are fixed (no autotune) and there are no atomics, so results
     are bitwise reproducible run-to-run and rank-to-rank.
+
+TMA: on Hopper+ with 16-byte-aligned rows, hidden/weight tiles load through
+tensor descriptors (async bulk copies that bypass L1, free LSU issue slots,
+and drop the bounds-check address math; descriptor OOB reads zero-fill exactly
+like the masked pointer loads they replace). Pointer loads remain the fallback
+for other GPUs and unaligned shapes.
 """
+
+import os
 
 import torch
 import triton
@@ -41,9 +49,34 @@ _NUM_STAGES = 3
 # (needs ~288 KB), so drop to 2 pipeline stages for fp32.
 _NUM_STAGES_FP32 = 2
 
+# LIGER_CHUNKED_GRPO_TMA=0 forces the pointer-load path (debug escape hatch).
+_TMA_DISABLED = os.environ.get("LIGER_CHUNKED_GRPO_TMA", "1").lower() in ("0", "false", "no")
+
 
 def _num_stages(dtype: torch.dtype) -> int:
     return _NUM_STAGES_FP32 if dtype == torch.float32 else _NUM_STAGES
+
+
+def _tma_alloc_fn(size: int, alignment: int, stream):
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+
+
+def _use_tma(hidden: torch.Tensor, weight: torch.Tensor, n_tokens: int, v: int) -> bool:
+    """Device-side TMA descriptors need sm90+, 16-byte-aligned rows, and
+    int32-addressable extents. Registers Triton's global-scratch allocator on
+    success — in the caller's thread, because the ContextVar holding it does
+    not propagate to the autograd engine's backward thread."""
+    if _TMA_DISABLED or hidden.device.type != "cuda":
+        return False
+    if torch.cuda.get_device_capability(hidden.device)[0] < 9:
+        return False
+    itemsize = hidden.element_size()
+    if (hidden.stride(0) * itemsize) % 16 != 0 or (weight.stride(0) * itemsize) % 16 != 0:
+        return False
+    if max(n_tokens, v, hidden.stride(0), weight.stride(0)) >= 2**31:
+        return False
+    triton.set_allocator(_tma_alloc_fn)
+    return True
 
 
 # Sequence-chunk size for the backward grad_logits buffer
@@ -69,11 +102,22 @@ def _chunked_selective_logp_fwd_kernel(
     BM: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
+    USE_TMA: tl.constexpr,
 ):
     pid = tl.program_id(0)
     rows = pid * BM + tl.arange(0, BM)
     row_mask = rows < N
     tgt = tl.load(TARGETS + rows, mask=row_mask, other=-1)
+
+    if USE_TMA:
+        # Descriptor OOB reads zero-fill, matching the masked loads' other=0.0.
+        h_desc = tl.make_tensor_descriptor(
+            HIDDEN, shape=[N, H], strides=[stride_hn, 1], block_shape=[BM, BK]
+        )
+        w_desc = tl.make_tensor_descriptor(
+            W, shape=[V, H], strides=[stride_wv, 1], block_shape=[BN, BK]
+        )
+    row0 = pid * BM
 
     m_i = tl.full((BM,), float("-inf"), tl.float32)
     l_i = tl.zeros((BM,), tl.float32)
@@ -84,20 +128,24 @@ def _chunked_selective_logp_fwd_kernel(
         col_mask = cols < V
         acc = tl.zeros((BM, BN), tl.float32)
         for k0 in tl.range(0, H, BK):
-            k = k0 + tl.arange(0, BK)
-            a = tl.load(
-                HIDDEN + rows[:, None] * stride_hn + k[None, :],
-                mask=row_mask[:, None],
-                other=0.0,
-            )
-            if EVEN_V:
-                b = tl.load(W + cols[:, None] * stride_wv + k[None, :])
+            if USE_TMA:
+                a = h_desc.load([row0, k0])
+                b = w_desc.load([v0, k0])
             else:
-                b = tl.load(
-                    W + cols[:, None] * stride_wv + k[None, :],
-                    mask=col_mask[:, None],
+                k = k0 + tl.arange(0, BK)
+                a = tl.load(
+                    HIDDEN + rows[:, None] * stride_hn + k[None, :],
+                    mask=row_mask[:, None],
                     other=0.0,
                 )
+                if EVEN_V:
+                    b = tl.load(W + cols[:, None] * stride_wv + k[None, :])
+                else:
+                    b = tl.load(
+                        W + cols[:, None] * stride_wv + k[None, :],
+                        mask=col_mask[:, None],
+                        other=0.0,
+                    )
             acc = tl.dot(a, tl.trans(b), acc)  # single dot per acc per iteration
         logits = acc * inv_temp
         if not EVEN_V:
@@ -134,6 +182,7 @@ def _chunked_grad_logits_kernel(
     BM: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
+    USE_TMA: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -142,22 +191,36 @@ def _chunked_grad_logits_kernel(
     cols = pid_n * BN + tl.arange(0, BN)
     col_mask = cols < V
 
+    if USE_TMA:
+        h_desc = tl.make_tensor_descriptor(
+            HIDDEN, shape=[N, H], strides=[stride_hn, 1], block_shape=[BM, BK]
+        )
+        w_desc = tl.make_tensor_descriptor(
+            W, shape=[V, H], strides=[stride_wv, 1], block_shape=[BN, BK]
+        )
+    m_row0 = row0 + pid_m * BM
+    n_col0 = pid_n * BN
+
     acc = tl.zeros((BM, BN), tl.float32)
     for k0 in tl.range(0, H, BK):
-        k = k0 + tl.arange(0, BK)
-        a = tl.load(
-            HIDDEN + rows[:, None] * stride_hn + k[None, :],
-            mask=row_mask[:, None],
-            other=0.0,
-        )
-        if EVEN_V:
-            b = tl.load(W + cols[:, None] * stride_wv + k[None, :])
+        if USE_TMA:
+            a = h_desc.load([m_row0, k0])
+            b = w_desc.load([n_col0, k0])
         else:
-            b = tl.load(
-                W + cols[:, None] * stride_wv + k[None, :],
-                mask=col_mask[:, None],
+            k = k0 + tl.arange(0, BK)
+            a = tl.load(
+                HIDDEN + rows[:, None] * stride_hn + k[None, :],
+                mask=row_mask[:, None],
                 other=0.0,
             )
+            if EVEN_V:
+                b = tl.load(W + cols[:, None] * stride_wv + k[None, :])
+            else:
+                b = tl.load(
+                    W + cols[:, None] * stride_wv + k[None, :],
+                    mask=col_mask[:, None],
+                    other=0.0,
+                )
         acc = tl.dot(a, tl.trans(b), acc)  # single dot per acc per iteration
     logits = acc * inv_temp
 
@@ -216,6 +279,7 @@ class ChunkedSelectiveLogPFunction(torch.autograd.Function):
             BM=_BM,
             BN=_BN,
             BK=_BK,
+            USE_TMA=_use_tma(hidden, weight, n_tokens, v),
             num_warps=_NUM_WARPS,
             num_stages=_num_stages(hidden.dtype),
         )
@@ -247,6 +311,9 @@ class ChunkedSelectiveLogPFunction(torch.autograd.Function):
         grad_weight = torch.zeros(v, h, dtype=torch.float32, device=weight.device)
         chunk = min(_BWD_SEQ_CHUNK, n_tokens)
         buf = torch.empty(chunk, v, dtype=hidden.dtype, device=hidden.device)
+        # Re-evaluated here because backward may run on the autograd engine's
+        # thread, which does not inherit the allocator ContextVar.
+        use_tma = _use_tma(hidden, weight, n_tokens, v)
 
         for row0 in range(0, n_tokens, chunk):
             n = min(chunk, n_tokens - row0)
@@ -270,6 +337,7 @@ class ChunkedSelectiveLogPFunction(torch.autograd.Function):
                 BM=_BM,
                 BN=_BN,
                 BK=_BK,
+                USE_TMA=use_tma,
                 num_warps=_NUM_WARPS,
                 num_stages=_num_stages(hidden.dtype),
             )
@@ -309,6 +377,7 @@ def chunked_selective_log_softmax_with_lse(hidden, weight, targets, temperature=
         BM=_BM,
         BN=_BN,
         BK=_BK,
+        USE_TMA=_use_tma(hidden, weight, n_tokens, v),
         num_warps=_NUM_WARPS,
         num_stages=_num_stages(hidden.dtype),
     )
